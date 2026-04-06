@@ -139,6 +139,82 @@ test.describe('API Integration Tests', () => {
     }
   });
 
+  test('windowsPty should keep the final prompt visible after a clear redraw burst', async () => {
+    const promptText = 'C:\\very\\long\\working\\directory\\with\\enough\\characters\\to\\wrap\\demo>';
+    const clearLines = '\x1b[K\r\n'.repeat(23) + '\x1b[K';
+    const startupChunks = [
+      '\x1b[?9001h\x1b[?1004h',
+      `\x1b[?25l\x1b[2J\x1b[m\x1b[H${promptText}\x1b[1C\x1b]0;pwsh.exe\x07\x1b[?25h`
+    ];
+    const clearChunks = [
+      '\x1b[?25l',
+      '\x1b[93mclear\x1b[?25h',
+      '\x1b[m\r\n',
+      '\x1b[?25l\x1b[H\x1b[?25h',
+      `\x1b[?25l${clearLines}\x1b[H\x1b[?25h`,
+      '\x1b[3J',
+      `\x1b[?25l${promptText}${clearLines}\x1b[1;62H\x1b[?25h`
+    ];
+
+    await ctx.page.evaluate(({ promptText, startupChunks, clearChunks }) => {
+      const container = document.querySelector('#terminal-container') as HTMLElement | null;
+      if (!container) {
+        throw new Error('Missing #terminal-container');
+      }
+      container.replaceChildren();
+      Object.assign(container.style, {
+        display: 'grid',
+        gridTemplateColumns: '1fr 1fr',
+        gap: '8px'
+      });
+
+      const terminals: any[] = [];
+      for (let i = 0; i < 4; i++) {
+        const host = document.createElement('div');
+        Object.assign(host.style, {
+          width: '400px',
+          height: '200px'
+        });
+        container.appendChild(host);
+        const term = new (window as any).Terminal({
+          cols: 80,
+          rows: 12,
+          windowsPty: { backend: 'conpty', buildNumber: 22631 }
+        });
+        term.open(host);
+        terminals.push(term);
+      }
+
+      (window as any).terminals = terminals;
+      (window as any).term = terminals[0];
+      (window as any).promptText = promptText;
+
+      for (const chunk of startupChunks) {
+        for (const term of terminals) {
+          term.write(chunk);
+        }
+      }
+
+      for (const chunk of clearChunks) {
+        terminals[0].write(chunk);
+      }
+    }, { promptText, startupChunks, clearChunks });
+
+    await pollFor(ctx.page, `window.term.buffer.active.getLine(0).translateToString(true)`, promptText);
+    await timeout(100);
+
+    strictEqual(
+      await ctx.page.evaluate(`
+        (() => {
+          const rows = window.term?.element?.querySelector('.xterm-rows');
+          return rows?.textContent?.includes(window.promptText) ?? false;
+        })()
+      `),
+      true,
+      'The rendered rows should still include the final prompt after a ConPTY clear redraw burst'
+    );
+  });
+
   test.describe('options', () => {
     test('getter', async () => {
       await openTerminal(ctx);
