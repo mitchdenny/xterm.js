@@ -500,28 +500,33 @@ export class KittyGraphicsHandler implements IApcHandler, IResetHandler, IDispos
     // Per spec: default delete selector is 'a' (delete all visible placements)
     const selector = cmd.deleteSelector ?? 'a';
 
-    // TODO: Distinguish lowercase (delete placements only) from uppercase
-    // (delete placements + free stored image data). Currently both variants
-    // free everything since we don't separate stored data from placements.
     switch (selector) {
       case 'a':
+        this._cleanupAllPending();
+        this._kittyStorage.deleteVisiblePlacements(false);
+        break;
       case 'A':
         this._cleanupAllPending();
-        this._kittyStorage.deleteAll();
+        this._kittyStorage.deleteVisiblePlacements(true);
         break;
       case 'i':
-      case 'I':
-        // TODO: When placement id tracking is implemented (see TODO in
-        // KittyImageStorage), d=i with p=<pid> should delete only that
-        // specific placement, while d=i without p should delete all
-        // placements for the image.
         if (cmd.id !== undefined) {
           const pending = this._pendingTransmissions.get(cmd.id);
           if (pending) {
             pending.decoder.release();
           }
           this._removePendingEntry(cmd.id);
-          this._kittyStorage.deleteById(cmd.id);
+          this._kittyStorage.deletePlacements(cmd.id, cmd.placementId);
+        }
+        break;
+      case 'I':
+        if (cmd.id !== undefined) {
+          const pending = this._pendingTransmissions.get(cmd.id);
+          if (pending) {
+            pending.decoder.release();
+          }
+          this._removePendingEntry(cmd.id);
+          this._kittyStorage.deleteImage(cmd.id, cmd.placementId);
         }
         break;
       default:
@@ -550,9 +555,14 @@ export class KittyGraphicsHandler implements IApcHandler, IResetHandler, IDispos
   }
 
   private async _decodeAndDisplay(image: IKittyImageData, cmd: IKittyCommand): Promise<void> {
-    let bitmap: ImageBitmap | undefined = await this._createBitmap(image);
+    const operationGeneration = this._kittyStorage.operationGeneration;
+    const source = await this._kittyStorage.getDecodedImage(image.id, () => this._createBitmap(image));
+    let bitmap: ImageBitmap | undefined;
 
     try {
+      bitmap = await createImageBitmap(source);
+      this._kittyStorage.enforceCacheLimit();
+
       const cropX = Math.max(0, cmd.x ?? 0);
       const cropY = Math.max(0, cmd.y ?? 0);
       const cropW = cmd.sourceWidth || (bitmap.width - cropX);
@@ -661,7 +671,10 @@ export class KittyGraphicsHandler implements IApcHandler, IResetHandler, IDispos
       }
 
       const zIndex = cmd.zIndex ?? 0;
-      this._kittyStorage.addImage(image.id, bitmap, true, layer, zIndex);
+      if (!this._kittyStorage.isPlacementOperationCurrent(operationGeneration, image)) {
+        throw new Error('image placement was invalidated');
+      }
+      this._kittyStorage.addImage(image.id, cmd.placementId ?? 0, bitmap, true, layer, zIndex);
       bitmap = undefined;  // ownership transferred to storage
 
       // Kitty cursor movement
@@ -680,6 +693,7 @@ export class KittyGraphicsHandler implements IApcHandler, IResetHandler, IDispos
       }
     } catch (e) {
       bitmap?.close();
+      this._kittyStorage.enforceCacheLimit();
       throw e;
     }
   }

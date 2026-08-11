@@ -18,6 +18,12 @@ export const CELL_SIZE_DEFAULT: ICellSize = {
   height: 14
 };
 
+export interface IImageStoragePixelCache {
+  readonly pixelCount: number;
+  evict(pixels: number): number;
+  clear(): void;
+}
+
 /**
  * Extend extended attribute to also hold image tile information.
  *
@@ -116,6 +122,9 @@ const EMPTY_ATTRS = new ExtendedAttrsImage();
 export class ImageStorage implements IDisposable {
   // storage
   private _images: Map<number, IImageSpec> = new Map();
+  private _evictedImages: Map<number, Pick<IImageSpec, 'marker' | 'bufferType'>> = new Map();
+  private _imageCells: Map<number, Map<IBufferLineExt, Set<number>>> = new Map();
+  private _pixelCaches: Set<IImageStoragePixelCache> = new Set();
   // last used id
   private _lastId = 0;
   // last evicted id
@@ -155,13 +164,28 @@ export class ImageStorage implements IDisposable {
   }
 
   public reset(): void {
+    for (const cache of this._pixelCaches) {
+      cache.clear();
+    }
     for (const spec of this._images.values()) {
+      spec.marker?.dispose();
+    }
+    for (const spec of this._evictedImages.values()) {
       spec.marker?.dispose();
     }
     // NOTE: marker.dispose above already calls ImageBitmap.close
     // therefore we can just wipe the map here
     this._images.clear();
+    this._evictedImages.clear();
+    this._imageCells.clear();
     this._renderer.clearAll();
+  }
+
+  public registerPixelCache(cache: IImageStoragePixelCache): IDisposable {
+    this._pixelCaches.add(cache);
+    return {
+      dispose: () => this._pixelCaches.delete(cache)
+    };
   }
 
   public getLimit(): number {
@@ -173,6 +197,10 @@ export class ImageStorage implements IDisposable {
       throw RangeError('invalid storageLimit, should be at least 0.5 MB and not exceed 1G');
     }
     this._pixelLimit = (value / 4 * 1000000) >>> 0;
+    this._evictOldest(0);
+  }
+
+  public enforceLimit(): void {
     this._evictOldest(0);
   }
 
@@ -190,15 +218,20 @@ export class ImageStorage implements IDisposable {
         }
       }
     }
+    for (const cache of this._pixelCaches) {
+      storedPixels += cache.pixelCount;
+    }
     return storedPixels;
   }
 
   private _delImg(id: number): void {
     const spec = this._images.get(id);
-    if (!spec) return;
+    if (!spec && !this._evictedImages.has(id) && !this._imageCells.has(id)) return;
     this._images.delete(id);
+    this._evictedImages.delete(id);
+    this._imageCells.delete(id);
     // FIXME: really ugly workaround to get bitmaps deallocated :(
-    if (window.ImageBitmap && spec.orig instanceof ImageBitmap) {
+    if (window.ImageBitmap && spec?.orig instanceof ImageBitmap) {
       spec.orig.close();
     }
     this.onImageDeleted?.(id);
@@ -216,6 +249,12 @@ export class ImageStorage implements IDisposable {
         zero.push(id);
       }
     }
+    for (const [id, spec] of this._evictedImages.entries()) {
+      if (spec.bufferType === 'alternate') {
+        spec.marker?.dispose();
+        zero.push(id);
+      }
+    }
     for (const id of zero) {
       this._delImg(id);
     }
@@ -228,12 +267,49 @@ export class ImageStorage implements IDisposable {
    * Delete an image by its internal storage ID.
    * Used by protocols that support explicit deletion (e.g. Kitty a=d).
    */
-  public deleteImage(id: number): void {
-    const spec = this._images.get(id);
-    if (spec) {
-      spec.marker?.dispose();
-      this._delImg(id);
+  public deleteImage(id: number): number {
+    return this.deleteImages([id]);
+  }
+
+  public deleteImages(ids: Iterable<number>): number {
+    const uniqueIds = new Set(ids);
+    const clearedCells = this._clearImageCells(uniqueIds);
+    for (const id of uniqueIds) {
+      const spec = this._images.get(id);
+      const evicted = this._evictedImages.get(id);
+      if (spec || evicted || this._imageCells.has(id)) {
+        (spec?.marker ?? evicted?.marker)?.dispose();
+        this._delImg(id);
+      }
     }
+    if (uniqueIds.size) {
+      this._needsFullClear = true;
+      this._fullyCleared = false;
+      this._terminal._core._inputHandler._dirtyRowTracker.markAllDirty();
+    }
+    return clearedCells;
+  }
+
+  public getVisibleImageStorageIds(): Set<number> {
+    const result = new Set<number>();
+    const buffer = this._terminal._core.buffer;
+    const end = Math.min(buffer.ydisp + this._terminal.rows, buffer.lines.length);
+    for (let row = buffer.ydisp; row < end; row++) {
+      const line = buffer.lines.get(row) as IBufferLineExt | undefined;
+      if (!line) {
+        continue;
+      }
+      for (let col = 0; col < this._terminal.cols; col++) {
+        if (!(line._data[col * Cell.SIZE + Cell.BG] & BgFlags.HAS_EXTENDED)) {
+          continue;
+        }
+        const imageId = line._extendedAttrs[col]?.imageId;
+        if (imageId !== undefined && imageId !== -1 && this._imageCells.has(imageId)) {
+          result.add(imageId);
+        }
+      }
+    }
+    return result;
   }
 
   /**
@@ -260,6 +336,7 @@ export class ImageStorage implements IDisposable {
     const rows = Math.ceil(img.height / cellSize.height);
 
     const imageId = ++this._lastId;
+    this._imageCells.set(imageId, new Map());
 
     const buffer = this._terminal._core.buffer;
     const termCols = this._terminal.cols;
@@ -320,10 +397,7 @@ export class ImageStorage implements IDisposable {
     // delete the image when the marker gets disposed
     const endMarker = this._terminal.registerMarker(0);
     endMarker?.onDispose(() => {
-      const spec = this._images.get(imageId);
-      if (spec) {
-        this._delImg(imageId);
-      }
+      this._delImg(imageId);
     });
 
     // since markers do not work on alternate for some reason,
@@ -359,7 +433,7 @@ export class ImageStorage implements IDisposable {
   // TODO: Should we move this to the ImageRenderer?
   public render(range: { start: number, end: number }): void {
     // Determine which layers have images
-    let hasTopImages = false;
+    let hasTopImages = !!this._evictedImages.size;
     let hasBottomImages = false;
     for (const spec of this._images.values()) {
       if (spec.layer === 'bottom') {
@@ -383,7 +457,7 @@ export class ImageStorage implements IDisposable {
     this._renderer.rescaleCanvas();
 
     // exit early if we dont have any images to test for
-    if (!this._images.size) {
+    if (!this._images.size && !this._evictedImages.size) {
       if (!this._fullyCleared) {
         this._renderer.clearAll();
         this._fullyCleared = true;
@@ -487,9 +561,13 @@ export class ImageStorage implements IDisposable {
 
   public viewportResize(metrics: { cols: number, rows: number }): void {
     // exit early if we have nothing in storage
-    if (!this._images.size) {
+    if (!this._images.size && !this._evictedImages.size) {
       this._viewportMetrics = metrics;
       return;
+    }
+
+    if (metrics.cols !== this._viewportMetrics.cols) {
+      this._rebuildImageCellIndex();
     }
 
     // handle only viewport width enlargements, exit all other cases
@@ -586,6 +664,14 @@ export class ImageStorage implements IDisposable {
   private _evictOldest(room: number): number {
     const used = this._getStoredPixels();
     let current = used;
+    let evictedImage = false;
+    for (const cache of this._pixelCaches) {
+      const needed = current + room - this._pixelLimit;
+      if (needed <= 0) {
+        break;
+      }
+      current -= cache.evict(needed);
+    }
     while (this._pixelLimit < current + room && this._images.size) {
       const spec = this._images.get(++this._lowestId);
       if (spec && spec.orig) {
@@ -593,38 +679,186 @@ export class ImageStorage implements IDisposable {
         if (spec.actual && spec.orig !== spec.actual) {
           current -= spec.actual.width * spec.actual.height;
         }
-        spec.marker?.dispose();
-        this._delImg(this._lowestId);
+        this._images.delete(this._lowestId);
+        this._evictedImages.set(this._lowestId, {
+          marker: spec.marker,
+          bufferType: spec.bufferType
+        });
+        evictedImage = true;
+        if (window.ImageBitmap && spec.orig instanceof ImageBitmap) {
+          spec.orig.close();
+        }
       }
+    }
+    if (evictedImage) {
+      this._needsFullClear = true;
+      this._fullyCleared = false;
+      this._terminal._core._inputHandler._dirtyRowTracker.markAllDirty();
+      this._terminal._core._renderService.refreshRows(0, this._terminal.rows - 1);
     }
     return used - current;
   }
 
   private _writeToCell(line: IBufferLineExt, x: number, imageId: number, tileId: number): void {
-    if (line._data[x * Cell.SIZE + Cell.BG] & BgFlags.HAS_EXTENDED) {
-      const old = line._extendedAttrs[x];
+    const hasExtendedAttrs = !!(line._data[x * Cell.SIZE + Cell.BG] & BgFlags.HAS_EXTENDED);
+    const old = hasExtendedAttrs ? line._extendedAttrs[x] : undefined;
+    if (old?.imageId !== undefined) {
+      const oldSpec = this._images.get(old.imageId);
+      if (oldSpec) {
+        // early eviction for in-viewport overwrites
+        oldSpec.tileCount--;
+      }
+      this._untrackCell(old.imageId, line, x);
+      if (hasExtendedAttrs) {
+        // ExtendedAttrsImage instances are always isolated to a single cell.
+        old.imageId = imageId;
+        old.tileId = tileId;
+        this._trackCell(imageId, line, x);
+        return;
+      }
+    }
+    if (hasExtendedAttrs) {
       if (old) {
-        if (old.imageId !== undefined) {
-          // found an old ExtendedAttrsImage, since we know that
-          // they are always isolated instances (single cell usage),
-          // we can re-use it and just update their id entries
-          const oldSpec = this._images.get(old.imageId);
-          if (oldSpec) {
-            // early eviction for in-viewport overwrites
-            oldSpec.tileCount--;
-          }
-          old.imageId = imageId;
-          old.tileId = tileId;
-          return;
-        }
         // found a plain ExtendedAttrs instance, clone it to new entry
         line._extendedAttrs[x] = new ExtendedAttrsImage(old.ext, old.urlId, imageId, tileId);
+        this._trackCell(imageId, line, x);
         return;
       }
     }
     // fall-through: always create new ExtendedAttrsImage entry
     line._data[x * Cell.SIZE + Cell.BG] |= BgFlags.HAS_EXTENDED;
     line._extendedAttrs[x] = new ExtendedAttrsImage(0, 0, imageId, tileId);
+    this._trackCell(imageId, line, x);
+  }
+
+  private _trackCell(imageId: number, line: IBufferLineExt, x: number): void {
+    let lines = this._imageCells.get(imageId);
+    if (!lines) {
+      lines = new Map();
+      this._imageCells.set(imageId, lines);
+    }
+    let columns = lines.get(line);
+    if (!columns) {
+      columns = new Set();
+      lines.set(line, columns);
+    }
+    columns.add(x);
+  }
+
+  private _untrackCell(imageId: number, line: IBufferLineExt, x: number): void {
+    const lines = this._imageCells.get(imageId);
+    if (!lines) {
+      return;
+    }
+    const columns = lines.get(line);
+    if (!columns) {
+      return;
+    }
+    const deleted = columns.delete(x);
+    let remainingColumns = columns;
+    if (!deleted || !columns.size) {
+      const shiftedColumns = new Set<number>();
+      for (const key of Object.keys(line._extendedAttrs)) {
+        const column = Number(key);
+        if (
+          column !== x &&
+          line._data[column * Cell.SIZE + Cell.BG] & BgFlags.HAS_EXTENDED &&
+          line._extendedAttrs[column]?.imageId === imageId
+        ) {
+          shiftedColumns.add(column);
+        }
+      }
+      if (shiftedColumns.size) {
+        lines.set(line, shiftedColumns);
+        remainingColumns = shiftedColumns;
+      } else {
+        lines.delete(line);
+      }
+    }
+    if (!remainingColumns.size) {
+      lines.delete(line);
+    }
+    if (!lines.size && this._evictedImages.has(imageId)) {
+      this._evictedImages.get(imageId)?.marker?.dispose();
+      this._delImg(imageId);
+    }
+  }
+
+  private _clearImageCells(imageIds: ReadonlySet<number>): number {
+    let cleared = 0;
+    for (const imageId of imageIds) {
+      const lines = this._imageCells.get(imageId);
+      if (!lines) {
+        continue;
+      }
+      for (const line of lines.keys()) {
+        for (const key of Object.keys(line._extendedAttrs)) {
+          const x = Number(key);
+          if (!(line._data[x * Cell.SIZE + Cell.BG] & BgFlags.HAS_EXTENDED)) {
+            continue;
+          }
+          const attrs = line._extendedAttrs[x];
+          if (attrs?.imageId !== imageId) {
+            continue;
+          }
+          attrs.imageId = -1;
+          attrs.tileId = -1;
+          if (attrs.isEmpty()) {
+            delete line._extendedAttrs[x];
+            line._data[x * Cell.SIZE + Cell.BG] &= ~BgFlags.HAS_EXTENDED;
+          }
+          cleared++;
+        }
+      }
+    }
+    return cleared;
+  }
+
+  private _rebuildImageCellIndex(): void {
+    this._imageCells.clear();
+    for (const [id, spec] of this._images) {
+      this._imageCells.set(id, new Map());
+      spec.tileCount = 0;
+    }
+    for (const id of this._evictedImages.keys()) {
+      this._imageCells.set(id, new Map());
+    }
+    const buffers = [this._terminal._core.buffers.normal, this._terminal._core.buffers.alt];
+    for (const buffer of buffers) {
+      for (let y = 0; y < buffer.lines.length; y++) {
+        const line = buffer.lines.get(y) as IBufferLineExt;
+        if (!line) {
+          continue;
+        }
+        for (const key of Object.keys(line._extendedAttrs)) {
+          const x = Number(key);
+          if (x >= line.length) {
+            delete line._extendedAttrs[x];
+            continue;
+          }
+          if (!(line._data[x * Cell.SIZE + Cell.BG] & BgFlags.HAS_EXTENDED)) {
+            continue;
+          }
+          const imageId = line._extendedAttrs[x]?.imageId;
+          if (imageId === undefined || !this._imageCells.has(imageId)) {
+            continue;
+          }
+          this._trackCell(imageId, line, x);
+          const spec = this._images.get(imageId);
+          if (spec) {
+            spec.tileCount++;
+          }
+        }
+      }
+    }
+    const emptyImageIds = [...this._imageCells]
+      .filter(([, lines]) => !lines.size)
+      .map(([imageId]) => imageId);
+    for (const imageId of emptyImageIds) {
+      const marker = this._images.get(imageId)?.marker ?? this._evictedImages.get(imageId)?.marker;
+      marker?.dispose();
+      this._delImg(imageId);
+    }
   }
 
   private _evictOnAlternate(): void {

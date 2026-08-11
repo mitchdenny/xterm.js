@@ -4,42 +4,64 @@
  */
 
 import { IDisposable } from '@xterm/xterm';
-import { ImageStorage } from '../ImageStorage';
+import { IImageStoragePixelCache, ImageStorage } from '../ImageStorage';
 import { ImageLayer, IAddImageOpts } from '../Types';
 import { IKittyImageData } from './KittyGraphicsTypes';
 
+interface IStoredKittyImage extends IKittyImageData {
+  decodedSource?: ImageBitmap;
+  decodePromise?: Promise<ImageBitmap>;
+  decodedPixels: number;
+  lastDecodeUse: number;
+  decodeGeneration: number;
+}
+
+interface IKittyPlacement {
+  imageId: number;
+  placementId: number;
+}
+
+const enum Constants {
+  MAX_STORED_IMAGES = 256
+}
+
 // Kitty-specific image storage controller.
 //
-// Wraps shared ImageStorage with kitty protocol semantics:
-// - tracks transmitted image payloads by kitty image id
-// - tracks kitty image id -> shared ImageStorage id mapping for displayed images
-// - mirrors shared-storage evictions into kitty maps
-// - applies protocol-level undisplayed-image eviction policy
-export class KittyImageStorage implements IDisposable {
-  private static readonly _maxStoredImages = 256;
-
+// Transmitted image data is image-scoped and survives placement deletion.
+// Displayed placements are tracked independently by (image id, placement id);
+// omitted/zero placement ids are anonymous and additive.
+export class KittyImageStorage implements IDisposable, IImageStoragePixelCache {
   private _nextImageId = 1;
-  private readonly _images: Map<number, IKittyImageData> = new Map();
-  // TODO: Support multiple placements per image. The kitty spec identifies
-  // placements by an (image id, placement id) pair — same i + different p
-  // values should coexist, and same i + same p should replace the prior
-  // placement. Currently we track only one storage entry per kitty image id,
-  // so multiple placements of the same image overwrite each other. Fixing
-  // this requires changing these maps to Map<number, Map<number, number>>
-  // (kittyId → placementId → storageId) and updating addImage/deleteById
-  // accordingly. The underlying shared ImageStorage would also need to
-  // support multiple entries per logical image.
-  private readonly _kittyIdToStorageId: Map<number, number> = new Map();
-  private readonly _storageIdToKittyId: Map<number, number> = new Map();
+  private _decodeUseSequence = 0;
+  private _decodedPixels = 0;
+  private _operationGeneration = 0;
+  private _isDisposed = false;
+  private readonly _images: Map<number, IStoredKittyImage> = new Map();
+  private readonly _namedPlacements: Map<number, Map<number, number>> = new Map();
+  private readonly _anonymousPlacements: Map<number, Set<number>> = new Map();
+  private readonly _storageIdToPlacement: Map<number, IKittyPlacement> = new Map();
 
   private readonly _previousOnImageDeleted: ((storageId: number) => void) | undefined;
   private readonly _wrappedOnImageDeleted: (storageId: number) => void;
+  private readonly _pixelCacheRegistration: IDisposable;
   private readonly _handleStorageImageDeleted = (storageId: number): void => {
-    const kittyId = this._storageIdToKittyId.get(storageId);
-    if (kittyId !== undefined) {
-      this._kittyIdToStorageId.delete(kittyId);
-      this._storageIdToKittyId.delete(storageId);
-      this._images.delete(kittyId);
+    const placement = this._storageIdToPlacement.get(storageId);
+    if (!placement) {
+      return;
+    }
+    this._storageIdToPlacement.delete(storageId);
+    if (placement.placementId > 0) {
+      const named = this._namedPlacements.get(placement.imageId);
+      named?.delete(placement.placementId);
+      if (!named?.size) {
+        this._namedPlacements.delete(placement.imageId);
+      }
+    } else {
+      const anonymous = this._anonymousPlacements.get(placement.imageId);
+      anonymous?.delete(storageId);
+      if (!anonymous?.size) {
+        this._anonymousPlacements.delete(placement.imageId);
+      }
     }
   };
   private _addImageOpts: IAddImageOpts = { scrolling: true, layer: 'top', zIndex: 0, cursorPos: 'iip' };
@@ -53,81 +75,228 @@ export class KittyImageStorage implements IDisposable {
       this._handleStorageImageDeleted(storageId);
     };
     this._storage.onImageDeleted = this._wrappedOnImageDeleted;
+    this._pixelCacheRegistration = this._storage.registerPixelCache(this);
   }
 
   public reset(): void {
+    this._invalidatePlacementOperations();
+    this._deleteAllPlacements();
+    this.clear();
     this._nextImageId = 1;
     this._images.clear();
-    this._kittyIdToStorageId.clear();
-    this._storageIdToKittyId.clear();
+    this._namedPlacements.clear();
+    this._anonymousPlacements.clear();
+    this._storageIdToPlacement.clear();
   }
 
   public dispose(): void {
+    if (this._isDisposed) {
+      return;
+    }
     this.reset();
+    this._isDisposed = true;
+    this._invalidatePlacementOperations();
+    this._pixelCacheRegistration.dispose();
     if (this._storage.onImageDeleted === this._wrappedOnImageDeleted) {
       this._storage.onImageDeleted = this._previousOnImageDeleted;
     }
   }
 
   public storeImage(id: number | undefined, imageData: Omit<IKittyImageData, 'id'>): number {
+    this._invalidatePlacementOperations();
     const imageId = id ?? this._nextImageId++;
 
-    const oldStorageId = this._kittyIdToStorageId.get(imageId);
-    if (oldStorageId !== undefined) {
-      this._storage.deleteImage(oldStorageId);
-      this._kittyIdToStorageId.delete(imageId);
-      this._storageIdToKittyId.delete(oldStorageId);
+    this._deletePlacements(imageId);
+    if (this._images.has(imageId)) {
+      this._deleteImageData(imageId);
     }
 
-    if (!this._images.has(imageId) && this._images.size >= KittyImageStorage._maxStoredImages) {
+    if (this._images.size >= Constants.MAX_STORED_IMAGES) {
       this._evictUndisplayedImages();
+      while (this._images.size >= Constants.MAX_STORED_IMAGES) {
+        const oldestImageId = this._images.keys().next().value;
+        if (oldestImageId === undefined) {
+          break;
+        }
+        this._deleteImageData(oldestImageId);
+      }
     }
 
     this._images.set(imageId, {
       ...imageData,
-      id: imageId
+      id: imageId,
+      decodedPixels: 0,
+      lastDecodeUse: 0,
+      decodeGeneration: 0
     });
     return imageId;
   }
 
-  public addImage(kittyId: number, image: HTMLCanvasElement | ImageBitmap, scrolling: boolean, layer: ImageLayer, zIndex: number): void {
-    // Clean up stale reverse-mapping from a previous placement of the same
-    // kitty image.  The old shared-storage entry is kept (it may still be
-    // visible on screen) but its reverse mapping is removed so that eviction
-    // of the old entry won't incorrectly delete the kitty image data.
-    const oldStorageId = this._kittyIdToStorageId.get(kittyId);
-    if (oldStorageId !== undefined) {
-      this._storageIdToKittyId.delete(oldStorageId);
+  public addImage(kittyId: number, placementId: number, image: HTMLCanvasElement | ImageBitmap, scrolling: boolean, layer: ImageLayer, zIndex: number): void {
+    if (placementId > 0) {
+      const oldStorageId = this._namedPlacements.get(kittyId)?.get(placementId);
+      if (oldStorageId !== undefined) {
+        this._storage.deleteImage(oldStorageId);
+      }
     }
+
     this._addImageOpts.scrolling = scrolling;
     this._addImageOpts.layer = layer;
     this._addImageOpts.zIndex = zIndex;
     const storageId = this._storage.addImage(image, this._addImageOpts);
-    this._kittyIdToStorageId.set(kittyId, storageId);
-    this._storageIdToKittyId.set(storageId, kittyId);
+    this._storageIdToPlacement.set(storageId, { imageId: kittyId, placementId });
+
+    if (placementId > 0) {
+      let named = this._namedPlacements.get(kittyId);
+      if (!named) {
+        named = new Map();
+        this._namedPlacements.set(kittyId, named);
+      }
+      named.set(placementId, storageId);
+    } else {
+      let anonymous = this._anonymousPlacements.get(kittyId);
+      if (!anonymous) {
+        anonymous = new Set();
+        this._anonymousPlacements.set(kittyId, anonymous);
+      }
+      anonymous.add(storageId);
+    }
   }
 
   public getImage(kittyId: number): IKittyImageData | undefined {
     return this._images.get(kittyId);
   }
 
-  public deleteById(kittyId: number): void {
-    this._images.delete(kittyId);
-    const storageId = this._kittyIdToStorageId.get(kittyId);
-    if (storageId !== undefined) {
-      this._storage.deleteImage(storageId);
-      this._kittyIdToStorageId.delete(kittyId);
-      this._storageIdToKittyId.delete(storageId);
+  public getDecodedImage(kittyId: number, decode: () => Promise<ImageBitmap>): Promise<ImageBitmap> {
+    const image = this._images.get(kittyId);
+    if (!image) {
+      return Promise.reject(new Error('image not found'));
+    }
+    image.lastDecodeUse = ++this._decodeUseSequence;
+    if (image.decodedSource) {
+      return Promise.resolve(image.decodedSource);
+    }
+    if (image.decodePromise) {
+      return image.decodePromise;
+    }
+
+    const generation = image.decodeGeneration;
+    const promise = decode().then(bitmap => {
+      if (this._images.get(kittyId) !== image || image.decodeGeneration !== generation) {
+        bitmap.close();
+        throw new Error('image data was deleted while decoding');
+      }
+      image.decodePromise = undefined;
+      image.decodedSource = bitmap;
+      image.decodedPixels = bitmap.width * bitmap.height;
+      image.lastDecodeUse = ++this._decodeUseSequence;
+      this._decodedPixels += image.decodedPixels;
+      return bitmap;
+    }, error => {
+      if (image.decodePromise === promise) {
+        image.decodePromise = undefined;
+      }
+      throw error;
+    });
+    image.decodePromise = promise;
+    return promise;
+  }
+
+  public get operationGeneration(): number {
+    return this._operationGeneration;
+  }
+
+  public isPlacementOperationCurrent(generation: number, image: IKittyImageData): boolean {
+    return !this._isDisposed &&
+      generation === this._operationGeneration &&
+      this._images.get(image.id) === image;
+  }
+
+  public enforceCacheLimit(): void {
+    this._storage.enforceLimit();
+  }
+
+  public deletePlacements(kittyId: number, placementId?: number): void {
+    this._invalidatePlacementOperations();
+    this._deletePlacements(kittyId, placementId);
+  }
+
+  public deleteVisiblePlacements(freeData: boolean): void {
+    this._invalidatePlacementOperations();
+    const storageIds = new Set<number>();
+    const kittyIds = new Set<number>();
+    for (const storageId of this._storage.getVisibleImageStorageIds()) {
+      const placement = this._storageIdToPlacement.get(storageId);
+      if (placement) {
+        storageIds.add(storageId);
+        kittyIds.add(placement.imageId);
+      }
+    }
+    if (storageIds.size) {
+      this._storage.deleteImages(storageIds);
+    }
+    if (freeData) {
+      for (const kittyId of kittyIds) {
+        if (!this._hasPlacements(kittyId)) {
+          this._deleteImageData(kittyId);
+        }
+      }
     }
   }
 
-  public deleteAll(): void {
-    this._images.clear();
-    for (const storageId of this._kittyIdToStorageId.values()) {
-      this._storage.deleteImage(storageId);
+  public deleteImage(kittyId: number, placementId?: number): void {
+    this._invalidatePlacementOperations();
+    this._deletePlacements(kittyId, placementId);
+    if (!this._hasPlacements(kittyId)) {
+      this._deleteImageData(kittyId);
     }
-    this._kittyIdToStorageId.clear();
-    this._storageIdToKittyId.clear();
+  }
+
+  private _deletePlacements(kittyId: number, placementId?: number): void {
+    if (placementId !== undefined && placementId > 0) {
+      const storageId = this._namedPlacements.get(kittyId)?.get(placementId);
+      if (storageId !== undefined) {
+        this._storage.deleteImage(storageId);
+      }
+      return;
+    }
+
+    const storageIds = this._getPlacementStorageIds(kittyId);
+    if (storageIds.length) {
+      this._storage.deleteImages(storageIds);
+    }
+  }
+
+  private _deleteAllPlacements(): void {
+    const storageIds = [...this._storageIdToPlacement.keys()];
+    if (storageIds.length) {
+      this._storage.deleteImages(storageIds);
+    }
+  }
+
+  public get pixelCount(): number {
+    return this._decodedPixels;
+  }
+
+  public evict(pixels: number): number {
+    let freed = 0;
+    const candidates = [...this._images.values()]
+      .filter(image => image.decodedSource)
+      .sort((a, b) => a.lastDecodeUse - b.lastDecodeUse);
+    for (const image of candidates) {
+      if (freed >= pixels) {
+        break;
+      }
+      freed += image.decodedPixels;
+      this._dropDecodedSource(image);
+    }
+    return freed;
+  }
+
+  public clear(): void {
+    for (const image of this._images.values()) {
+      this._dropDecodedSource(image);
+    }
   }
 
   public get images(): ReadonlyMap<number, IKittyImageData> {
@@ -135,20 +304,72 @@ export class KittyImageStorage implements IDisposable {
   }
 
   public get kittyIdToStorageId(): ReadonlyMap<number, number> {
-    return this._kittyIdToStorageId;
+    const result = new Map<number, number>();
+    for (const [kittyId, placements] of this._namedPlacements) {
+      const storageId = placements.values().next().value;
+      if (storageId !== undefined) {
+        result.set(kittyId, storageId);
+      }
+    }
+    for (const [kittyId, placements] of this._anonymousPlacements) {
+      if (result.has(kittyId)) {
+        continue;
+      }
+      const storageId = placements.values().next().value;
+      if (storageId !== undefined) {
+        result.set(kittyId, storageId);
+      }
+    }
+    return result;
   }
 
   public get lastImageId(): number {
     return this._nextImageId - 1;
   }
 
+  private _getPlacementStorageIds(kittyId: number): number[] {
+    return [
+      ...this._namedPlacements.get(kittyId)?.values() ?? [],
+      ...this._anonymousPlacements.get(kittyId)?.values() ?? []
+    ];
+  }
+
+  private _deleteImageData(kittyId: number): void {
+    const image = this._images.get(kittyId);
+    if (!image) {
+      return;
+    }
+    this._dropDecodedSource(image);
+    this._images.delete(kittyId);
+  }
+
+  private _hasPlacements(kittyId: number): boolean {
+    return !!this._namedPlacements.get(kittyId)?.size ||
+      !!this._anonymousPlacements.get(kittyId)?.size;
+  }
+
+  private _invalidatePlacementOperations(): void {
+    this._operationGeneration++;
+  }
+
+  private _dropDecodedSource(image: IStoredKittyImage): void {
+    image.decodeGeneration++;
+    image.decodePromise = undefined;
+    if (image.decodedSource) {
+      image.decodedSource.close();
+      image.decodedSource = undefined;
+      this._decodedPixels -= image.decodedPixels;
+    }
+    image.decodedPixels = 0;
+  }
+
   private _evictUndisplayedImages(): void {
     for (const [kittyId] of this._images) {
-      if (this._images.size <= KittyImageStorage._maxStoredImages / 2) {
+      if (this._images.size <= Constants.MAX_STORED_IMAGES / 2) {
         break;
       }
-      if (!this._kittyIdToStorageId.has(kittyId)) {
-        this._images.delete(kittyId);
+      if (!this._namedPlacements.has(kittyId) && !this._anonymousPlacements.has(kittyId)) {
+        this._deleteImageData(kittyId);
       }
     }
   }
