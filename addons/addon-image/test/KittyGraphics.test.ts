@@ -94,6 +94,10 @@ const RAW_RGBA_5X1 = Buffer.from([
   255, 0, 255, 255
 ]).toString('base64');
 
+const enum TestBgFlags {
+  HAS_EXTENDED = 0x10000000
+}
+
 let ctx: ITestContext;
 test.beforeAll(async ({ browser }) => {
   ctx = await createTestContext(browser);
@@ -1510,6 +1514,41 @@ test.describe('Kitty Graphics Protocol', () => {
       deepStrictEqual(await getRenderedViewportPixel(0, 4), [0, 0, 0, 255]);
     });
 
+    test('deletes visible placement cells whose extended flag was cleared by text', async () => {
+      await ctx.page.evaluate(`
+        window.imageAddon.dispose();
+        window.imageAddon = new ImageAddon({ showPlaceholder: true });
+        window.term.loadAddon(window.imageAddon);
+      `);
+      await ctx.proxy.write(`\x1b_Ga=t,f=32,s=1,v=1,i=942,t=d,q=2,m=0;${RAW_RGBA_1X1_RED}\x1b\\`);
+      await ctx.proxy.write('\x1b[1;1H\x1b_Ga=p,i=942,p=1,c=10,r=5,C=1,q=2\x1b\\');
+      await timeout(100);
+      const storageId = await getViewportCellImageId(0, 0);
+      ok(storageId > 0);
+
+      await ctx.proxy.write(Array.from({ length: 5 }, (_, row) => `\x1b[${row + 1};1Hxxxxxxxxxx`).join(''));
+      await timeout(100);
+
+      strictEqual(await countFlaglessBufferImageRefs(storageId), 50);
+      deepStrictEqual(await getRenderedViewportPixel(0, 0), [255, 0, 0, 255]);
+      await ctx.page.evaluate(() => (window as any).imageAddon._storage.viewportResize({ cols: 79, rows: 24 }));
+      strictEqual(await ctx.page.evaluate(`window.imageAddon._storage._images.has(${storageId})`), true);
+
+      await ctx.proxy.write('\x1b_Ga=d,d=a,q=2\x1b\\');
+      await timeout(100);
+
+      strictEqual(await getImageStorageLength(), 0);
+      strictEqual(await countBufferImageRefs(storageId), 0);
+      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.has(942)`), true);
+      strictEqual(await getRenderedViewportPixel(0, 0), null);
+
+      await ctx.proxy.write('\x1b_Ga=d,d=I,i=942,q=2\x1b\\');
+      await timeout(100);
+
+      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.has(942)`), false);
+      strictEqual(await countDanglingBufferImageRefs(), 0);
+    });
+
     for (const [selector, imageId] of [['a', 930], ['A', 931]] as const) {
       test(`d=${selector} deletes only visible placements and preserves scrollback references`, async () => {
         await ctx.proxy.write(`\x1b_Ga=t,f=100,i=${imageId};${KITTY_BLACK_1X1_BASE64}\x1b\\`);
@@ -2884,6 +2923,45 @@ async function countBufferImageRefs(imageId: number): Promise<number> {
     }
     return count;
   }, imageId);
+}
+
+async function countFlaglessBufferImageRefs(imageId: number): Promise<number> {
+  return ctx.page.evaluate((imageId: number) => {
+    const buffers = (window as any).term._core.buffers;
+    let count = 0;
+    for (const buffer of [buffers.normal, buffers.alt]) {
+      for (let row = 0; row < buffer.lines.length; row++) {
+        const line = buffer.lines.get(row);
+        for (const key of Object.keys(line?._extendedAttrs ?? {})) {
+          const column = Number(key);
+          if (line._extendedAttrs[column]?.imageId === imageId && !(line.getBg(column) & TestBgFlags.HAS_EXTENDED)) {
+            count++;
+          }
+        }
+      }
+    }
+    return count;
+  }, imageId);
+}
+
+async function countDanglingBufferImageRefs(): Promise<number> {
+  return ctx.page.evaluate(() => {
+    const term = (window as any).term;
+    const storage = (window as any).imageAddon._storage;
+    let count = 0;
+    for (const buffer of [term._core.buffers.normal, term._core.buffers.alt]) {
+      for (let row = 0; row < buffer.lines.length; row++) {
+        const line = buffer.lines.get(row);
+        for (const key of Object.keys(line?._extendedAttrs ?? {})) {
+          const imageId = line._extendedAttrs[Number(key)]?.imageId;
+          if (imageId !== undefined && imageId !== -1 && !storage._images.has(imageId) && !storage._evictedImages.has(imageId)) {
+            count++;
+          }
+        }
+      }
+    }
+    return count;
+  });
 }
 
 async function countActiveBufferImageRefs(imageId: number): Promise<number> {

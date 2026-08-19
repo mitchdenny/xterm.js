@@ -300,9 +300,7 @@ export class ImageStorage implements IDisposable {
         continue;
       }
       for (let col = 0; col < this._terminal.cols; col++) {
-        if (!(line._data[col * Cell.SIZE + Cell.BG] & BgFlags.HAS_EXTENDED)) {
-          continue;
-        }
+        // Text writes can clear HAS_EXTENDED while leaving top-layer image metadata live.
         const imageId = line._extendedAttrs[col]?.imageId;
         if (imageId !== undefined && imageId !== -1 && this._imageCells.has(imageId)) {
           result.add(imageId);
@@ -701,7 +699,7 @@ export class ImageStorage implements IDisposable {
 
   private _writeToCell(line: IBufferLineExt, x: number, imageId: number, tileId: number): void {
     const hasExtendedAttrs = !!(line._data[x * Cell.SIZE + Cell.BG] & BgFlags.HAS_EXTENDED);
-    const old = hasExtendedAttrs ? line._extendedAttrs[x] : undefined;
+    const old = line._extendedAttrs[x];
     if (old?.imageId !== undefined) {
       const oldSpec = this._images.get(old.imageId);
       if (oldSpec) {
@@ -762,7 +760,6 @@ export class ImageStorage implements IDisposable {
         const column = Number(key);
         if (
           column !== x &&
-          line._data[column * Cell.SIZE + Cell.BG] & BgFlags.HAS_EXTENDED &&
           line._extendedAttrs[column]?.imageId === imageId
         ) {
           shiftedColumns.add(column);
@@ -794,9 +791,6 @@ export class ImageStorage implements IDisposable {
       for (const line of lines.keys()) {
         for (const key of Object.keys(line._extendedAttrs)) {
           const x = Number(key);
-          if (!(line._data[x * Cell.SIZE + Cell.BG] & BgFlags.HAS_EXTENDED)) {
-            continue;
-          }
           const attrs = line._extendedAttrs[x];
           if (attrs?.imageId !== imageId) {
             continue;
@@ -834,9 +828,6 @@ export class ImageStorage implements IDisposable {
           const x = Number(key);
           if (x >= line.length) {
             delete line._extendedAttrs[x];
-            continue;
-          }
-          if (!(line._data[x * Cell.SIZE + Cell.BG] & BgFlags.HAS_EXTENDED)) {
             continue;
           }
           const imageId = line._extendedAttrs[x]?.imageId;
