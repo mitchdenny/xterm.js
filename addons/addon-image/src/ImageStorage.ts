@@ -8,7 +8,7 @@ import { ImageRenderer } from './ImageRenderer';
 import {
   ITerminalExt, IExtendedAttrsImage, IImageAddonOptions, IImageSpec,
   IBufferLineExt, BgFlags, Cell, Content, ICellSize, ExtFlags, Attributes,
-  UnderlineStyle, IAddImageOpts
+  UnderlineStyle, IAddImageOpts, ImageLayer
 } from './Types';
 
 
@@ -122,7 +122,7 @@ const EMPTY_ATTRS = new ExtendedAttrsImage();
 export class ImageStorage implements IDisposable {
   // storage
   private _images: Map<number, IImageSpec> = new Map();
-  private _evictedImages: Map<number, Pick<IImageSpec, 'marker' | 'bufferType'>> = new Map();
+  private _evictedImages: Map<number, Pick<IImageSpec, 'marker' | 'bufferType' | 'layer'>> = new Map();
   private _imageCells: Map<number, Map<IBufferLineExt, Set<number>>> = new Map();
   private _pixelCaches: Set<IImageStoragePixelCache> = new Set();
   // last used id
@@ -293,14 +293,16 @@ export class ImageStorage implements IDisposable {
   public getVisibleImageStorageIds(): Set<number> {
     const result = new Set<number>();
     const buffer = this._terminal._core.buffer;
-    const end = Math.min(buffer.ydisp + this._terminal.rows, buffer.lines.length);
-    for (let row = buffer.ydisp; row < end; row++) {
+    const end = Math.min(buffer.ybase + this._terminal.rows, buffer.lines.length);
+    for (let row = buffer.ybase; row < end; row++) {
       const line = buffer.lines.get(row) as IBufferLineExt | undefined;
       if (!line) {
         continue;
       }
       for (let col = 0; col < this._terminal.cols; col++) {
-        // Text writes can clear HAS_EXTENDED while leaving top-layer image metadata live.
+        if (!(line._data[col * Cell.SIZE + Cell.BG] & BgFlags.HAS_EXTENDED)) {
+          continue;
+        }
         const imageId = line._extendedAttrs[col]?.imageId;
         if (imageId !== undefined && imageId !== -1 && this._imageCells.has(imageId)) {
           result.add(imageId);
@@ -431,7 +433,7 @@ export class ImageStorage implements IDisposable {
   // TODO: Should we move this to the ImageRenderer?
   public render(range: { start: number, end: number }): void {
     // Determine which layers have images
-    let hasTopImages = !!this._evictedImages.size;
+    let hasTopImages = false;
     let hasBottomImages = false;
     for (const spec of this._images.values()) {
       if (spec.layer === 'bottom') {
@@ -440,6 +442,16 @@ export class ImageStorage implements IDisposable {
         hasTopImages = true;
       }
       if (hasTopImages && hasBottomImages) break;
+    }
+    if (!hasTopImages || !hasBottomImages) {
+      for (const spec of this._evictedImages.values()) {
+        if (spec.layer === 'bottom') {
+          hasBottomImages = true;
+        } else {
+          hasTopImages = true;
+        }
+        if (hasTopImages && hasBottomImages) break;
+      }
     }
 
     // Lazily insert layers that are needed
@@ -496,7 +508,7 @@ export class ImageStorage implements IDisposable {
 
     // Collect draw calls so we can sort by z-index (lower z drawn first).
     const drawCalls: { imgSpec: IImageSpec, tileId: number, col: number, row: number, count: number }[] = [];
-    const placeholderCalls: { col: number, row: number, count: number }[] = [];
+    const placeholderCalls: { col: number, row: number, count: number, layer: ImageLayer }[] = [];
 
     // walk all cells in viewport and collect tiles found
     for (let row = start; row <= end; ++row) {
@@ -535,7 +547,12 @@ export class ImageStorage implements IDisposable {
                 drawCalls.push({ imgSpec, tileId: startTile, col: startCol, row, count });
               }
             } else if (this._opts.showPlaceholder) {
-              placeholderCalls.push({ col: startCol, row, count });
+              placeholderCalls.push({
+                col: startCol,
+                row,
+                count,
+                layer: this._evictedImages.get(imageId)?.layer ?? 'top'
+              });
             }
             this._fullyCleared = false;
           }
@@ -548,7 +565,7 @@ export class ImageStorage implements IDisposable {
 
     // Draw placeholders first (lowest priority)
     for (const call of placeholderCalls) {
-      this._renderer.drawPlaceholder(call.col, call.row, call.count);
+      this._renderer.drawPlaceholder(call.col, call.row, call.count, call.layer);
     }
 
     // Draw images in z-index order
@@ -680,7 +697,8 @@ export class ImageStorage implements IDisposable {
         this._images.delete(this._lowestId);
         this._evictedImages.set(this._lowestId, {
           marker: spec.marker,
-          bufferType: spec.bufferType
+          bufferType: spec.bufferType,
+          layer: spec.layer
         });
         evictedImage = true;
         if (window.ImageBitmap && spec.orig instanceof ImageBitmap) {
@@ -699,7 +717,7 @@ export class ImageStorage implements IDisposable {
 
   private _writeToCell(line: IBufferLineExt, x: number, imageId: number, tileId: number): void {
     const hasExtendedAttrs = !!(line._data[x * Cell.SIZE + Cell.BG] & BgFlags.HAS_EXTENDED);
-    const old = line._extendedAttrs[x];
+    const old = hasExtendedAttrs ? line._extendedAttrs[x] : undefined;
     if (old?.imageId !== undefined) {
       const oldSpec = this._images.get(old.imageId);
       if (oldSpec) {
@@ -760,6 +778,7 @@ export class ImageStorage implements IDisposable {
         const column = Number(key);
         if (
           column !== x &&
+          line._data[column * Cell.SIZE + Cell.BG] & BgFlags.HAS_EXTENDED &&
           line._extendedAttrs[column]?.imageId === imageId
         ) {
           shiftedColumns.add(column);
@@ -791,6 +810,9 @@ export class ImageStorage implements IDisposable {
       for (const line of lines.keys()) {
         for (const key of Object.keys(line._extendedAttrs)) {
           const x = Number(key);
+          if (!(line._data[x * Cell.SIZE + Cell.BG] & BgFlags.HAS_EXTENDED)) {
+            continue;
+          }
           const attrs = line._extendedAttrs[x];
           if (attrs?.imageId !== imageId) {
             continue;
@@ -828,6 +850,9 @@ export class ImageStorage implements IDisposable {
           const x = Number(key);
           if (x >= line.length) {
             delete line._extendedAttrs[x];
+            continue;
+          }
+          if (!(line._data[x * Cell.SIZE + Cell.BG] & BgFlags.HAS_EXTENDED)) {
             continue;
           }
           const imageId = line._extendedAttrs[x]?.imageId;

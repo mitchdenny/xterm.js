@@ -94,10 +94,6 @@ const RAW_RGBA_5X1 = Buffer.from([
   255, 0, 255, 255
 ]).toString('base64');
 
-const enum TestBgFlags {
-  HAS_EXTENDED = 0x10000000
-}
-
 let ctx: ITestContext;
 test.beforeAll(async ({ browser }) => {
   ctx = await createTestContext(browser);
@@ -136,6 +132,18 @@ test.describe('Kitty Graphics Protocol', () => {
       await timeout(100);
       strictEqual(await getImageStorageLength(), 1);
       deepStrictEqual(await getOrigSize(1), [3, 1]);
+    });
+
+    test('a=T acknowledgement includes the placement id', async () => {
+      await ctx.page.evaluate(() => {
+        (window as any).kittyResponse = '';
+        (window as any).term.onData((data: string) => { (window as any).kittyResponse = data; });
+      });
+
+      await ctx.proxy.write(`\x1b_Ga=T,f=100,i=31,p=42;${KITTY_BLACK_1X1_BASE64}\x1b\\`);
+      await timeout(100);
+
+      strictEqual(await ctx.page.evaluate('window.kittyResponse'), '\x1b_Gi=31,p=42;OK\x1b\\');
     });
 
     test('transmit only (a=t) does not display but stores in handler', async () => {
@@ -382,19 +390,17 @@ test.describe('Kitty Graphics Protocol', () => {
       strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').pendingTransmissions.size`), 0);
     });
 
-    test('delete by id only aborts targeted upload, not others', async () => {
+    test('unsupported delete selector aborts an in-flight chunked upload', async () => {
       const half = Math.floor(KITTY_BLACK_1X1_BASE64.length / 2);
       const part1 = KITTY_BLACK_1X1_BASE64.substring(0, half);
 
       await ctx.proxy.write(`\x1b_Ga=t,f=100,i=55,m=1;${part1}\x1b\\`);
-      await ctx.proxy.write(`\x1b_Ga=t,f=100,i=56,m=1;${part1}\x1b\\`);
-      await timeout(50);
-      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').pendingTransmissions.size`), 2);
-
-      await ctx.proxy.write(`\x1b_Ga=d,d=i,i=55\x1b\\`);
       await timeout(50);
       strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').pendingTransmissions.size`), 1);
-      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').pendingTransmissions.has(56)`), true);
+
+      await ctx.proxy.write(`\x1b_Ga=d,d=c\x1b\\`);
+      await timeout(50);
+      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').pendingTransmissions.size`), 0);
     });
 
     test('delete all aborts in-flight chunked upload', async () => {
@@ -697,17 +703,17 @@ test.describe('Kitty Graphics Protocol', () => {
       strictEqual(await ctx.page.evaluate('window.kittyGotResponse'), false);
     });
 
-    test('a=T sends EINVAL on decode error when id is specified', async () => {
+    test('a=T sends EINVAL with placement id on decode error', async () => {
       await ctx.page.evaluate(() => {
         (window as any).kittyResponse = '';
         (window as any).term.onData((data: string) => { (window as any).kittyResponse = data; });
       });
 
-      await ctx.proxy.write('\x1b_Gi=120,a=T,f=100;!!!invalid!!!\x1b\\');
+      await ctx.proxy.write('\x1b_Gi=120,p=42,a=T,f=100;!!!invalid!!!\x1b\\');
       await timeout(100);
 
       const response = await ctx.page.evaluate('window.kittyResponse');
-      strictEqual(response, '\x1b_Gi=120;EINVAL:invalid base64 data\x1b\\');
+      strictEqual(response, '\x1b_Gi=120,p=42;EINVAL:invalid base64 data\x1b\\');
     });
 
     test('a=T sends no response on decode error without id', async () => {
@@ -952,17 +958,17 @@ test.describe('Kitty Graphics Protocol', () => {
       strictEqual(response, '');
     });
 
-    test('transmit+display rejects t=f with id (EINVAL response)', async () => {
+    test('transmit+display rejects t=f with placement id (EINVAL response)', async () => {
       await ctx.page.evaluate(() => {
         (window as any).kittyResponse = '';
         (window as any).term.onData((data: string) => { (window as any).kittyResponse = data; });
       });
 
-      await ctx.proxy.write(`\x1b_Gi=310,a=T,t=f,f=100;${KITTY_BLACK_1X1_BASE64}\x1b\\`);
+      await ctx.proxy.write(`\x1b_Gi=310,p=43,a=T,t=f,f=100;${KITTY_BLACK_1X1_BASE64}\x1b\\`);
       await timeout(100);
 
       const response: string = await ctx.page.evaluate('window.kittyResponse');
-      strictEqual(response.startsWith('\x1b_Gi=310;EINVAL:'), true);
+      strictEqual(response.startsWith('\x1b_Gi=310,p=43;EINVAL:'), true);
     });
 
     test('transmit+display rejects t=s with id (EINVAL response)', async () => {
@@ -1514,43 +1520,8 @@ test.describe('Kitty Graphics Protocol', () => {
       deepStrictEqual(await getRenderedViewportPixel(0, 4), [0, 0, 0, 255]);
     });
 
-    test('deletes visible placement cells whose extended flag was cleared by text', async () => {
-      await ctx.page.evaluate(`
-        window.imageAddon.dispose();
-        window.imageAddon = new ImageAddon({ showPlaceholder: true });
-        window.term.loadAddon(window.imageAddon);
-      `);
-      await ctx.proxy.write(`\x1b_Ga=t,f=32,s=1,v=1,i=942,t=d,q=2,m=0;${RAW_RGBA_1X1_RED}\x1b\\`);
-      await ctx.proxy.write('\x1b[1;1H\x1b_Ga=p,i=942,p=1,c=10,r=5,C=1,q=2\x1b\\');
-      await timeout(100);
-      const storageId = await getViewportCellImageId(0, 0);
-      ok(storageId > 0);
-
-      await ctx.proxy.write(Array.from({ length: 5 }, (_, row) => `\x1b[${row + 1};1Hxxxxxxxxxx`).join(''));
-      await timeout(100);
-
-      strictEqual(await countFlaglessBufferImageRefs(storageId), 50);
-      deepStrictEqual(await getRenderedViewportPixel(0, 0), [255, 0, 0, 255]);
-      await ctx.page.evaluate(() => (window as any).imageAddon._storage.viewportResize({ cols: 79, rows: 24 }));
-      strictEqual(await ctx.page.evaluate(`window.imageAddon._storage._images.has(${storageId})`), true);
-
-      await ctx.proxy.write('\x1b_Ga=d,d=a,q=2\x1b\\');
-      await timeout(100);
-
-      strictEqual(await getImageStorageLength(), 0);
-      strictEqual(await countBufferImageRefs(storageId), 0);
-      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.has(942)`), true);
-      strictEqual(await getRenderedViewportPixel(0, 0), null);
-
-      await ctx.proxy.write('\x1b_Ga=d,d=I,i=942,q=2\x1b\\');
-      await timeout(100);
-
-      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.has(942)`), false);
-      strictEqual(await countDanglingBufferImageRefs(), 0);
-    });
-
     for (const [selector, imageId] of [['a', 930], ['A', 931]] as const) {
-      test(`d=${selector} deletes only visible placements and preserves scrollback references`, async () => {
+      test(`d=${selector} deletes the live screen when the viewport is in scrollback`, async () => {
         await ctx.proxy.write(`\x1b_Ga=t,f=100,i=${imageId};${KITTY_BLACK_1X1_BASE64}\x1b\\`);
         await ctx.proxy.write(`\x1b[1;1H\x1b_Ga=p,i=${imageId},p=1,c=1,r=1,C=1\x1b\\`);
         await ctx.page.evaluate(() => new Promise<void>(resolve => {
@@ -1559,8 +1530,13 @@ test.describe('Kitty Graphics Protocol', () => {
         }));
         await ctx.proxy.write(`\x1b_Ga=p,i=${imageId},p=2,c=1,r=1,C=1\x1b\\`);
         await timeout(100);
+        await ctx.page.evaluate(() => (window as any).term.scrollToTop());
 
         strictEqual(await getImageStorageLength(), 2);
+        strictEqual(await ctx.page.evaluate(() => {
+          const buffer = (window as any).term._core.buffer;
+          return buffer.ydisp < buffer.ybase;
+        }), true);
         ok(await getAbsoluteCellImageId(0, 0) > 0);
         ok(await getViewportCellImageId(0, 23) > 0);
 
@@ -1653,6 +1629,18 @@ test.describe('Kitty Graphics Protocol', () => {
       strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.has(934)`), false);
     });
 
+    test('uppercase targeted delete with an unmatched placement preserves image data', async () => {
+      await ctx.proxy.write(`\x1b_Ga=t,f=100,i=935;${KITTY_BLACK_1X1_BASE64}\x1b\\`);
+      await ctx.proxy.write('\x1b_Ga=d,d=I,i=935,p=99\x1b\\');
+      await timeout(100);
+
+      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.has(935)`), true);
+
+      await ctx.proxy.write('\x1b_Ga=p,i=935,p=1,c=1,r=1,C=1\x1b\\');
+      await timeout(100);
+      strictEqual(await getImageStorageLength(), 1);
+    });
+
     test('uppercase delete frees matching payloads and every placement', async () => {
       await ctx.proxy.write(`\x1b_Ga=t,f=100,i=908;${KITTY_BLACK_1X1_BASE64}\x1b\\`);
       await ctx.proxy.write(`\x1b_Ga=t,f=100,i=909;${KITTY_BLACK_1X1_BASE64}\x1b\\`);
@@ -1714,7 +1702,7 @@ test.describe('Kitty Graphics Protocol', () => {
       strictEqual(await getImageStorageLength(), 1);
     });
 
-    test('caps retained image data when every image has a placement', async () => {
+    test('hard image cap evicts placements with their payload data', async () => {
       let sequence = '';
       for (let id = 1000; id <= 1256; id++) {
         sequence += `\x1b_Ga=T,f=32,s=1,v=1,i=${id},p=1,C=1;${RAW_RGBA_1X1_RED}\x1b\\\n`;
@@ -1725,8 +1713,8 @@ test.describe('Kitty Graphics Protocol', () => {
       strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.size`), 256);
       strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.has(1000)`), false);
       strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.has(1256)`), true);
-      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty')._kittyIdToStorageId.has(1000)`), true);
-      ok(await getAbsoluteCellImageId(0, 0) > 0);
+      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty')._kittyIdToStorageId.has(1000)`), false);
+      strictEqual(await getAbsoluteCellImageId(0, 0), -1);
 
       await ctx.proxy.write(`\x1b_Ga=t,f=32,s=1,v=1,i=1000;${RAW_RGBA_1X1_WHITE}\x1b\\`);
       await timeout(100);
@@ -2712,6 +2700,34 @@ test.describe('Kitty Graphics Protocol', () => {
       await ctx.page.evaluate('window.term.resize(80, 24)');
     });
 
+    test('memory limit eviction keeps a negative-z placeholder below text', async () => {
+      await ctx.page.evaluate(`
+        window.term.reset();
+        window.imageAddon?.dispose();
+        window.term.resize(80, 48);
+        window.imageAddon = new ImageAddon({ showPlaceholder: true, storageLimit: 0.5 });
+        window.term.loadAddon(window.imageAddon);
+      `);
+
+      await ctx.proxy.write(`\x1b[1;1H\x1b_Ga=T,f=100,i=67,z=-1,C=1;${KITTY_MULTICOLOR_200X100_BASE64}\x1b\\`);
+      await timeout(100);
+      const storageId = await ctx.page.evaluate<number | undefined>(`window.imageAddon._handlers.get('kitty')._kittyIdToStorageId.get(67)`);
+      ok(storageId !== undefined);
+
+      const positions = [[30, 1], [1, 9], [30, 9], [1, 17], [30, 17], [1, 25]];
+      for (let n = 0; n < positions.length; n++) {
+        const [col, row] = positions[n];
+        await ctx.proxy.write(`\x1b[${row};${col}H\x1b_Ga=T,f=100,i=${68 + n},z=1,C=1;${KITTY_MULTICOLOR_200X100_BASE64}\x1b\\`);
+      }
+      await pollFor(ctx.page, `window.imageAddon._storage._images.has(${storageId})`, false);
+      await timeout(100);
+
+      strictEqual(await ctx.page.evaluate(`window.imageAddon._storage._evictedImages.get(${storageId}).layer`), 'bottom');
+      const bottomPixel = await getRenderedLayerPixel('bottom', 0, 0);
+      ok(bottomPixel && bottomPixel[3] > 0);
+      deepStrictEqual(await getRenderedLayerPixel('top', 0, 0), [0, 0, 0, 0]);
+    });
+
     test('deletes a reflowed placement when only its evicted placeholder remains', async () => {
       await ctx.proxy.write(`\x1b_Ga=t,f=100,i=71;${KITTY_MULTICOLOR_200X100_BASE64}\x1b\\`);
       await ctx.proxy.write('\x1b_Ga=p,i=71,p=1,c=30,r=1,C=1\x1b\\');
@@ -2925,45 +2941,6 @@ async function countBufferImageRefs(imageId: number): Promise<number> {
   }, imageId);
 }
 
-async function countFlaglessBufferImageRefs(imageId: number): Promise<number> {
-  return ctx.page.evaluate((imageId: number) => {
-    const buffers = (window as any).term._core.buffers;
-    let count = 0;
-    for (const buffer of [buffers.normal, buffers.alt]) {
-      for (let row = 0; row < buffer.lines.length; row++) {
-        const line = buffer.lines.get(row);
-        for (const key of Object.keys(line?._extendedAttrs ?? {})) {
-          const column = Number(key);
-          if (line._extendedAttrs[column]?.imageId === imageId && !(line.getBg(column) & TestBgFlags.HAS_EXTENDED)) {
-            count++;
-          }
-        }
-      }
-    }
-    return count;
-  }, imageId);
-}
-
-async function countDanglingBufferImageRefs(): Promise<number> {
-  return ctx.page.evaluate(() => {
-    const term = (window as any).term;
-    const storage = (window as any).imageAddon._storage;
-    let count = 0;
-    for (const buffer of [term._core.buffers.normal, term._core.buffers.alt]) {
-      for (let row = 0; row < buffer.lines.length; row++) {
-        const line = buffer.lines.get(row);
-        for (const key of Object.keys(line?._extendedAttrs ?? {})) {
-          const imageId = line._extendedAttrs[Number(key)]?.imageId;
-          if (imageId !== undefined && imageId !== -1 && !storage._images.has(imageId) && !storage._evictedImages.has(imageId)) {
-            count++;
-          }
-        }
-      }
-    }
-    return count;
-  });
-}
-
 async function countActiveBufferImageRefs(imageId: number): Promise<number> {
   return (await getActiveBufferImageRefs(imageId)).length;
 }
@@ -3004,6 +2981,23 @@ async function getRenderedViewportPixels(col: number, row: number, x: number, y:
       height
     ).data);
   }, [col, row, x, y, width, height]);
+}
+
+async function getRenderedLayerPixel(layer: 'top' | 'bottom', col: number, row: number): Promise<number[] | null> {
+  return ctx.page.evaluate(({ layer, col, row }: { layer: 'top' | 'bottom', col: number, row: number }) => {
+    const canvas = document.querySelector(`.xterm-image-layer-${layer}`) as HTMLCanvasElement | null;
+    const dimensions = (window as any).term._core._renderService.dimensions.css.cell;
+    const context = canvas?.getContext('2d');
+    if (!context) {
+      return null;
+    }
+    return Array.from(context.getImageData(
+      Math.floor(col * dimensions.width),
+      Math.floor(row * dimensions.height),
+      1,
+      1
+    ).data);
+  }, { layer, col, row });
 }
 
 async function startBlobDecodeCounter(): Promise<void> {

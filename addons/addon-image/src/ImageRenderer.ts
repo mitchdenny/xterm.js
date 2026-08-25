@@ -240,8 +240,8 @@ export class ImageRenderer extends Disposable implements IDisposable {
   /**
    * Draw a line with placeholder on the image layer canvas.
    */
-  public drawPlaceholder(col: number, row: number, count: number = 1): void {
-    const ctx = this._layers.get('top');
+  public drawPlaceholder(col: number, row: number, count: number = 1, layer: ImageLayer = 'top'): void {
+    const ctx = this._layers.get(layer);
     if (ctx) {
       const { width, height } = this.cellSize;
 

@@ -403,7 +403,7 @@ export class KittyGraphicsHandler implements IApcHandler, IResetHandler, IDispos
     const transmission = cmd.transmission ?? 'd';
     if (transmission !== 'd') {
       if (cmd.id !== undefined) {
-        this._sendResponse(cmd.id, 'EINVAL:unsupported transmission medium', cmd.quiet ?? 0);
+        this._sendResponse(cmd.id, 'EINVAL:unsupported transmission medium', cmd.quiet ?? 0, cmd.placementId);
       }
       return true;
     }
@@ -423,7 +423,7 @@ export class KittyGraphicsHandler implements IApcHandler, IResetHandler, IDispos
   private _handleTransmitDisplay(cmd: IKittyCommand, bytes: Uint8Array, decodeError: boolean): boolean | Promise<boolean> {
     if (decodeError) {
       if (cmd.id !== undefined) {
-        this._sendResponse(cmd.id, 'EINVAL:invalid base64 data', cmd.quiet ?? 0);
+        this._sendResponse(cmd.id, 'EINVAL:invalid base64 data', cmd.quiet ?? 0, cmd.placementId);
       }
       return true;
     }
@@ -436,7 +436,7 @@ export class KittyGraphicsHandler implements IApcHandler, IResetHandler, IDispos
       const result = this._displayImage(image, cmd);
       if (cmd.id !== undefined) {
         return result.then(success => {
-          this._sendResponse(id, success ? 'OK' : 'EINVAL:image rendering failed', cmd.quiet ?? 0);
+          this._sendResponse(id, success ? 'OK' : 'EINVAL:image rendering failed', cmd.quiet ?? 0, cmd.placementId);
           return true;
         });
       }
@@ -497,35 +497,25 @@ export class KittyGraphicsHandler implements IApcHandler, IResetHandler, IDispos
   }
 
   private _handleDelete(cmd: IKittyCommand): boolean {
+    this._cleanupAllPending();
+
     // Per spec: default delete selector is 'a' (delete all visible placements)
     const selector = cmd.deleteSelector ?? 'a';
 
     switch (selector) {
       case 'a':
-        this._cleanupAllPending();
         this._kittyStorage.deleteVisiblePlacements(false);
         break;
       case 'A':
-        this._cleanupAllPending();
         this._kittyStorage.deleteVisiblePlacements(true);
         break;
       case 'i':
         if (cmd.id !== undefined) {
-          const pending = this._pendingTransmissions.get(cmd.id);
-          if (pending) {
-            pending.decoder.release();
-          }
-          this._removePendingEntry(cmd.id);
           this._kittyStorage.deletePlacements(cmd.id, cmd.placementId);
         }
         break;
       case 'I':
         if (cmd.id !== undefined) {
-          const pending = this._pendingTransmissions.get(cmd.id);
-          if (pending) {
-            pending.decoder.release();
-          }
-          this._removePendingEntry(cmd.id);
           this._kittyStorage.deleteImage(cmd.id, cmd.placementId);
         }
         break;

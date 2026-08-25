@@ -118,6 +118,7 @@ export class KittyImageStorage implements IDisposable, IImageStoragePixelCache {
         if (oldestImageId === undefined) {
           break;
         }
+        this._deletePlacements(oldestImageId);
         this._deleteImageData(oldestImageId);
       }
     }
@@ -246,25 +247,30 @@ export class KittyImageStorage implements IDisposable, IImageStoragePixelCache {
 
   public deleteImage(kittyId: number, placementId?: number): void {
     this._invalidatePlacementOperations();
-    this._deletePlacements(kittyId, placementId);
+    const placementDeleted = this._deletePlacements(kittyId, placementId);
+    if (placementId !== undefined && placementId > 0 && !placementDeleted) {
+      return;
+    }
     if (!this._hasPlacements(kittyId)) {
       this._deleteImageData(kittyId);
     }
   }
 
-  private _deletePlacements(kittyId: number, placementId?: number): void {
+  private _deletePlacements(kittyId: number, placementId?: number): boolean {
     if (placementId !== undefined && placementId > 0) {
       const storageId = this._namedPlacements.get(kittyId)?.get(placementId);
       if (storageId !== undefined) {
         this._storage.deleteImage(storageId);
+        return true;
       }
-      return;
+      return false;
     }
 
     const storageIds = this._getPlacementStorageIds(kittyId);
     if (storageIds.length) {
       this._storage.deleteImages(storageIds);
     }
+    return storageIds.length > 0;
   }
 
   private _deleteAllPlacements(): void {
