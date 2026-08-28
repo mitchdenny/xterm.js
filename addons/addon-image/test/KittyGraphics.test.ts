@@ -146,8 +146,8 @@ test.describe('Kitty Graphics Protocol', () => {
       strictEqual(await ctx.page.evaluate('window.kittyResponse'), '\x1b_Gi=31,p=42;OK\x1b\\');
     });
 
-    test('transmit only (a=t) does not display but stores in handler', async () => {
-      const seq = `\x1b_Ga=t,f=100;${KITTY_BLACK_1X1_BASE64}\x1b\\`;
+    test('transmit only (a=t) does not display but stores an addressable image', async () => {
+      const seq = `\x1b_Ga=t,f=100,i=41;${KITTY_BLACK_1X1_BASE64}\x1b\\`;
       await ctx.proxy.write(seq);
       await timeout(100);
       strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.size`), 1);
@@ -161,20 +161,18 @@ test.describe('Kitty Graphics Protocol', () => {
       strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.has(1)`), false);
     });
 
-    test('assigns auto-incrementing IDs when not specified', async () => {
+    test('discards id-less transmit-only payloads', async () => {
       await ctx.proxy.write(`\x1b_Ga=t,f=100;${KITTY_BLACK_1X1_BASE64}\x1b\\`);
       await ctx.proxy.write(`\x1b_Ga=t,f=100;${KITTY_RGB_3X1_BASE64}\x1b\\`);
       await timeout(100);
-      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.size`), 2);
-      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.has(1)`), true);
-      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.has(2)`), true);
+      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.size`), 0);
     });
 
     test('defaults to transmit action when action is omitted', async () => {
-      const seq = `\x1b_Gf=100;${KITTY_BLACK_1X1_BASE64}\x1b\\`;
+      const seq = `\x1b_Gf=100,i=42;${KITTY_BLACK_1X1_BASE64}\x1b\\`;
       await ctx.proxy.write(seq);
       await timeout(100);
-      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.size`), 1);
+      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.has(42)`), true);
     });
 
     test('ignores command when action is empty string', async () => {
@@ -662,6 +660,19 @@ test.describe('Kitty Graphics Protocol', () => {
       strictEqual(response, '\x1b_Gi=100;EINVAL:cannot specify both i and I keys\x1b\\');
     });
 
+    test('rejects image ids outside the unsigned 32-bit range', async () => {
+      await ctx.page.evaluate(() => {
+        (window as any).kittyResponse = '';
+        (window as any).term.onData((data: string) => { (window as any).kittyResponse = data; });
+      });
+
+      await ctx.proxy.write(`\x1b_Gi=-1,a=t,f=100;${KITTY_BLACK_1X1_BASE64}\x1b\\`);
+      await timeout(100);
+
+      strictEqual(await ctx.page.evaluate('window.kittyResponse'), '\x1b_Gi=-1;EINVAL:invalid image id\x1b\\');
+      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.size`), 0);
+    });
+
     test('responds with EINVAL for i+I conflict even without payload', async () => {
       await ctx.page.evaluate(() => {
         (window as any).kittyResponse = '';
@@ -726,6 +737,23 @@ test.describe('Kitty Graphics Protocol', () => {
       await timeout(100);
 
       strictEqual(await ctx.page.evaluate('window.kittyGotResponse'), false);
+    });
+
+    test('a=T sends EINVAL with placement id when image data is missing', async () => {
+      await ctx.proxy.write('\x1b[4;5H');
+      const cursorBefore = await getCursor();
+      await ctx.page.evaluate(() => {
+        (window as any).kittyResponse = '';
+        (window as any).term.onData((data: string) => { (window as any).kittyResponse = data; });
+      });
+
+      await ctx.proxy.write('\x1b_Gi=121,p=43,a=T,f=100;\x1b\\');
+      await timeout(100);
+
+      strictEqual(await ctx.page.evaluate('window.kittyResponse'), '\x1b_Gi=121,p=43;EINVAL:missing image data\x1b\\');
+      strictEqual(await getImageStorageLength(), 0);
+      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.has(121)`), false);
+      deepStrictEqual(await getCursor(), cursorBefore);
     });
 
     test('a=T sends EINVAL when raw pixel render fails (missing dimensions)', async () => {
@@ -958,7 +986,12 @@ test.describe('Kitty Graphics Protocol', () => {
       strictEqual(response, '');
     });
 
-    test('transmit+display rejects t=f with placement id (EINVAL response)', async () => {
+    test('failed transmit+display does not reuse an older image with the same id', async () => {
+      await ctx.proxy.write(`\x1b_Gi=310,a=t,q=2,f=100;${KITTY_BLACK_1X1_BASE64}\x1b\\`);
+      await ctx.proxy.write('\x1b[4;5H');
+      await timeout(100);
+      const cursorBefore = await getCursor();
+
       await ctx.page.evaluate(() => {
         (window as any).kittyResponse = '';
         (window as any).term.onData((data: string) => { (window as any).kittyResponse = data; });
@@ -968,7 +1001,11 @@ test.describe('Kitty Graphics Protocol', () => {
       await timeout(100);
 
       const response: string = await ctx.page.evaluate('window.kittyResponse');
-      strictEqual(response.startsWith('\x1b_Gi=310,p=43;EINVAL:'), true);
+      strictEqual(response, '\x1b_Gi=310,p=43;EINVAL:unsupported transmission medium\x1b\\');
+      strictEqual(await getImageStorageLength(), 0);
+      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty')._kittyIdToStorageId.has(310)`), false);
+      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.has(310)`), true);
+      deepStrictEqual(await getCursor(), cursorBefore);
     });
 
     test('transmit+display rejects t=s with id (EINVAL response)', async () => {
@@ -1473,6 +1510,78 @@ test.describe('Kitty Graphics Protocol', () => {
         await getViewportCellImageId(0, 4)
       ];
       strictEqual(new Set(storageIds).size, 3);
+    });
+
+    test('ignores placement id for ID-zero transmissions and releases payloads after deletion', async () => {
+      for (const imageIdControl of ['', ',i=0']) {
+        await ctx.proxy.write(`\x1b[1;1H\x1b_Ga=T${imageIdControl},p=7,c=1,r=1,C=1,f=100;${KITTY_BLACK_1X1_BASE64}\x1b\\`);
+        await timeout(100);
+
+        const placementState = await ctx.page.evaluate(() => {
+          const storage = (window as any).imageAddon._handlers.get('kitty')._kittyStorage;
+          const placement = [...storage._storageIdToPlacement.values()][0];
+          return {
+            namedPlacements: storage._namedPlacements.size,
+            anonymousPlacements: storage._anonymousPlacements.size,
+            placementId: placement?.placementId
+          };
+        });
+        deepStrictEqual(placementState, {
+          namedPlacements: 0,
+          anonymousPlacements: 1,
+          placementId: 0
+        });
+        strictEqual(await getImageStorageLength(), 1);
+        strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.size`), 1);
+
+        await ctx.proxy.write('\x1b_Ga=d,d=a\x1b\\');
+        await timeout(100);
+
+        strictEqual(await getImageStorageLength(), 0);
+        strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty')._kittyStorage._storageIdToPlacement.size`), 0);
+        strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.size`), 0);
+      }
+    });
+
+    test('d=A removes a placement and payload after all placement cells are overwritten', async () => {
+      await ctx.proxy.write(`\x1b_Ga=t,q=2,f=100,i=908;${KITTY_BLACK_1X1_BASE64}\x1b\\`);
+      await ctx.proxy.write('\x1b[1;1H\x1b_Ga=p,q=2,i=908,p=1,c=2,r=1,C=1\x1b\\');
+      await timeout(100);
+      const storageId = await ctx.page.evaluate<number | undefined>(`window.imageAddon._handlers.get('kitty')._kittyIdToStorageId.get(908)`);
+      ok(storageId !== undefined);
+
+      await ctx.proxy.write('\x1b[1;1H##');
+      await timeout(100);
+      strictEqual(await hasTileAtBufferCell(0, 0), false);
+      strictEqual(await hasTileAtBufferCell(1, 0), false);
+      strictEqual(await getImageStorageLength(), 1);
+      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty')._kittyIdToStorageId.has(908)`), true);
+
+      await ctx.proxy.write('\x1b_Ga=d,d=A\x1b\\');
+      await timeout(100);
+
+      strictEqual(await getImageStorageLength(), 0);
+      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty')._kittyIdToStorageId.has(908)`), false);
+      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.has(908)`), false);
+      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty')._kittyStorage._storageIdToPlacement.size`), 0);
+    });
+
+    test('d=A ignores detached buffer lines when reconciling overwritten placements', async () => {
+      await ctx.proxy.write(`\x1b_Ga=t,q=2,f=100,i=909;${KITTY_BLACK_1X1_BASE64}\x1b\\`);
+      await ctx.proxy.write('\x1b[1;1H\x1b_Ga=p,q=2,i=909,p=1,c=1,r=2,C=1\x1b\\');
+      await timeout(100);
+
+      await ctx.proxy.write('\x1b[1;1H\x1b[1M#');
+      await timeout(100);
+      strictEqual(await hasTileAtBufferCell(0, 0), false);
+      strictEqual(await getImageStorageLength(), 1);
+
+      await ctx.proxy.write('\x1b_Ga=d,d=A\x1b\\');
+      await timeout(100);
+
+      strictEqual(await getImageStorageLength(), 0);
+      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty')._kittyIdToStorageId.has(909)`), false);
+      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.has(909)`), false);
     });
 
     test('lowercase delete by image removes all placements but preserves payload', async () => {
@@ -2048,9 +2157,9 @@ test.describe('Kitty Graphics Protocol', () => {
       });
 
       test('transmit only (a=t) stores 200x100 image without display', async () => {
-        await ctx.proxy.write(`\x1b_Ga=t,f=100;${KITTY_MULTICOLOR_200X100_BASE64}\x1b\\`);
+        await ctx.proxy.write(`\x1b_Ga=t,f=100,i=401;${KITTY_MULTICOLOR_200X100_BASE64}\x1b\\`);
         await timeout(200);
-        strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.size`), 1);
+        strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.has(401)`), true);
       });
 
       test('stores with specified image ID', async () => {

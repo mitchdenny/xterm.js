@@ -29,7 +29,8 @@ const enum Constants {
   // Maximum control data size
   MAX_CONTROL_DATA_SIZE = 512,
   // Semicolon codepoint
-  SEMICOLON = 0x3B
+  SEMICOLON = 0x3B,
+  MAX_IMAGE_ID = 0xFFFFFFFF
 }
 
 const DECODER_OK = Constants.DECODER_OK as unknown as DecodeStatus.OK;
@@ -148,9 +149,7 @@ export class KittyGraphicsHandler implements IApcHandler, IResetHandler, IDispos
         // Found semicolon - parse control data early for validation
         this._parsedCommand = parseKittyCommand(this._parseControlDataString());
 
-        // Early validation: i+I conflict
-        if (this._parsedCommand.id !== undefined && this._parsedCommand.imageNumber !== undefined) {
-          this._sendResponse(this._parsedCommand.id, 'EINVAL:cannot specify both i and I keys', this._parsedCommand.quiet ?? 0);
+        if (!this._validateImageIdentifiers(this._parsedCommand)) {
           this._aborted = true;
           return;
         }
@@ -305,12 +304,29 @@ export class KittyGraphicsHandler implements IApcHandler, IResetHandler, IDispos
     return str;
   }
 
+  private _validateImageIdentifiers(cmd: IKittyCommand): boolean {
+    if (cmd.id !== undefined && cmd.imageNumber !== undefined) {
+      this._sendResponse(cmd.id, 'EINVAL:cannot specify both i and I keys', cmd.quiet ?? 0);
+      return false;
+    }
+    if (cmd.id === 0) {
+      cmd.id = undefined;
+      return true;
+    }
+    if (
+      cmd.id !== undefined &&
+      (!Number.isInteger(cmd.id) || cmd.id < 0 || cmd.id > Constants.MAX_IMAGE_ID)
+    ) {
+      this._sendResponse(cmd.id, 'EINVAL:invalid image id', cmd.quiet ?? 0);
+      return false;
+    }
+    return true;
+  }
+
   private _handleNoPayloadCommand(): boolean | Promise<boolean> {
     const cmd = parseKittyCommand(this._parseControlDataString());
 
-    // Per spec: specifying both i and I is an error
-    if (cmd.id !== undefined && cmd.imageNumber !== undefined) {
-      this._sendResponse(cmd.id, 'EINVAL:cannot specify both i and I keys', cmd.quiet ?? 0);
+    if (!this._validateImageIdentifiers(cmd)) {
       return true;
     }
 
@@ -341,7 +357,10 @@ export class KittyGraphicsHandler implements IApcHandler, IResetHandler, IDispos
 
     switch (action) {
       case KittyAction.TRANSMIT: {
-        const result = this._handleTransmit(cmd, bytes, decodeError);
+        const imageId = this._handleTransmit(cmd, bytes, decodeError);
+        if (cmd.id === undefined && imageId !== undefined) {
+          this._kittyStorage.releaseUnreferencedImage(imageId);
+        }
         // Only send response when _handleTransmit didn't already respond
         // (it handles unsupported transmission medium responses internally)
         if ((cmd.transmission ?? 'd') === 'd' && cmd.id !== undefined) {
@@ -351,7 +370,7 @@ export class KittyGraphicsHandler implements IApcHandler, IResetHandler, IDispos
             this._sendResponse(cmd.id, 'OK', cmd.quiet ?? 0);
           }
         }
-        return result;
+        return true;
       }
       case KittyAction.TRANSMIT_DISPLAY:
         return this._handleTransmitDisplay(cmd, bytes, decodeError);
@@ -389,7 +408,7 @@ export class KittyGraphicsHandler implements IApcHandler, IResetHandler, IDispos
     });
   }
 
-  private _handleTransmit(cmd: IKittyCommand, bytes: Uint8Array, decodeError: boolean): boolean {
+  private _handleTransmit(cmd: IKittyCommand, bytes: Uint8Array, decodeError: boolean): number | undefined {
     // TODO: Support file-based transmission modes (t=f, t=t, t=s)
     // Currently only supports direct transmission (t=d, the default).
     // - t=f (file): Payload is base64-encoded file path. Terminal reads image from that path.
@@ -405,19 +424,24 @@ export class KittyGraphicsHandler implements IApcHandler, IResetHandler, IDispos
       if (cmd.id !== undefined) {
         this._sendResponse(cmd.id, 'EINVAL:unsupported transmission medium', cmd.quiet ?? 0, cmd.placementId);
       }
-      return true;
+      return undefined;
     }
 
-    if (decodeError || bytes.length === 0) return true;
+    if (decodeError) return undefined;
+    if (bytes.length === 0) {
+      if (cmd.id !== undefined) {
+        this._sendResponse(cmd.id, 'EINVAL:missing image data', cmd.quiet ?? 0, cmd.placementId);
+      }
+      return undefined;
+    }
 
-    this._kittyStorage.storeImage(cmd.id, {
+    return this._kittyStorage.storeImage(cmd.id, {
       data: new Blob([bytes as BlobPart]),
       width: cmd.width ?? 0,
       height: cmd.height ?? 0,
       format: (cmd.format ?? KittyFormat.RGBA) as 24 | 32 | 100,
       compression: cmd.compression ?? ''
     });
-    return true;
   }
 
   private _handleTransmitDisplay(cmd: IKittyCommand, bytes: Uint8Array, decodeError: boolean): boolean | Promise<boolean> {
@@ -428,19 +452,24 @@ export class KittyGraphicsHandler implements IApcHandler, IResetHandler, IDispos
       return true;
     }
 
-    this._handleTransmit(cmd, bytes, decodeError);
-
-    const id = cmd.id ?? this._kittyStorage.lastImageId;
+    const id = this._handleTransmit(cmd, bytes, decodeError);
+    if (id === undefined) {
+      return true;
+    }
     const image = this._kittyStorage.getImage(id);
     if (image) {
-      const result = this._displayImage(image, cmd);
+      const placementCmd = cmd.id === undefined ? { ...cmd, placementId: 0 } : cmd;
+      const result = this._displayImage(image, placementCmd);
       if (cmd.id !== undefined) {
         return result.then(success => {
           this._sendResponse(id, success ? 'OK' : 'EINVAL:image rendering failed', cmd.quiet ?? 0, cmd.placementId);
           return true;
         });
       }
-      return result.then(() => true);
+      return result.then(() => {
+        this._kittyStorage.releaseUnreferencedImage(id);
+        return true;
+      });
     }
     return true;
   }

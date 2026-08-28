@@ -9,6 +9,7 @@ import { ImageLayer, IAddImageOpts } from '../Types';
 import { IKittyImageData } from './KittyGraphicsTypes';
 
 interface IStoredKittyImage extends IKittyImageData {
+  hasClientId: boolean;
   decodedSource?: ImageBitmap;
   decodePromise?: Promise<ImageBitmap>;
   decodedPixels: number;
@@ -31,7 +32,8 @@ const enum Constants {
 // Displayed placements are tracked independently by (image id, placement id);
 // omitted/zero placement ids are anonymous and additive.
 export class KittyImageStorage implements IDisposable, IImageStoragePixelCache {
-  private _nextImageId = 1;
+  // Keep id-less images outside the valid positive client ID namespace.
+  private _nextInternalImageId = -1;
   private _decodeUseSequence = 0;
   private _decodedPixels = 0;
   private _operationGeneration = 0;
@@ -63,6 +65,7 @@ export class KittyImageStorage implements IDisposable, IImageStoragePixelCache {
         this._anonymousPlacements.delete(placement.imageId);
       }
     }
+    this.releaseUnreferencedImage(placement.imageId);
   };
   private _addImageOpts: IAddImageOpts = { scrolling: true, layer: 'top', zIndex: 0, cursorPos: 'iip' };
 
@@ -82,7 +85,7 @@ export class KittyImageStorage implements IDisposable, IImageStoragePixelCache {
     this._invalidatePlacementOperations();
     this._deleteAllPlacements();
     this.clear();
-    this._nextImageId = 1;
+    this._nextInternalImageId = -1;
     this._images.clear();
     this._namedPlacements.clear();
     this._anonymousPlacements.clear();
@@ -104,7 +107,7 @@ export class KittyImageStorage implements IDisposable, IImageStoragePixelCache {
 
   public storeImage(id: number | undefined, imageData: Omit<IKittyImageData, 'id'>): number {
     this._invalidatePlacementOperations();
-    const imageId = id ?? this._nextImageId++;
+    const imageId = id ?? this._nextInternalImageId--;
 
     this._deletePlacements(imageId);
     if (this._images.has(imageId)) {
@@ -126,6 +129,7 @@ export class KittyImageStorage implements IDisposable, IImageStoragePixelCache {
     this._images.set(imageId, {
       ...imageData,
       id: imageId,
+      hasClientId: id !== undefined,
       decodedPixels: 0,
       lastDecodeUse: 0,
       decodeGeneration: 0
@@ -226,6 +230,12 @@ export class KittyImageStorage implements IDisposable, IImageStoragePixelCache {
     this._invalidatePlacementOperations();
     const storageIds = new Set<number>();
     const kittyIds = new Set<number>();
+    for (const [storageId, placement] of this._storageIdToPlacement) {
+      storageIds.add(storageId);
+      kittyIds.add(placement.imageId);
+    }
+    this._storage.reconcileImageCellIndexes(storageIds);
+    storageIds.clear();
     for (const storageId of this._storage.getVisibleImageStorageIds()) {
       const placement = this._storageIdToPlacement.get(storageId);
       if (placement) {
@@ -329,8 +339,11 @@ export class KittyImageStorage implements IDisposable, IImageStoragePixelCache {
     return result;
   }
 
-  public get lastImageId(): number {
-    return this._nextImageId - 1;
+  public releaseUnreferencedImage(kittyId: number): void {
+    const image = this._images.get(kittyId);
+    if (image && !image.hasClientId && !this._hasPlacements(kittyId)) {
+      this._deleteImageData(kittyId);
+    }
   }
 
   private _getPlacementStorageIds(kittyId: number): number[] {
