@@ -1450,6 +1450,56 @@ test.describe('Kitty Graphics Protocol', () => {
       deepStrictEqual(await ctx.page.evaluate('window._kittyCleanupCounts'), [2]);
     });
 
+    test('replaces a named placement after live buffer lines are cloned', async () => {
+      await ctx.proxy.write(`\x1b_Ga=t,f=100,i=913;${KITTY_BLACK_1X1_BASE64}\x1b\\`);
+
+      const oldStorageIds: number[] = [];
+      for (const [index, [row, column, cols]] of [
+        [1, 1, 2],
+        [3, 5, 3],
+        [5, 9, 4],
+        [3, 5, 3],
+        [1, 1, 2]
+      ].entries()) {
+        if (index) {
+          await ctx.page.evaluate(() => {
+            const buffers = (window as any).term._core.buffers;
+            for (const buffer of [buffers.normal, buffers.alt]) {
+              for (let row = 0; row < buffer.lines.length; row++) {
+                const line = buffer.lines.get(row);
+                if (line) {
+                  const clone = line.clone();
+                  for (const key of Object.keys(clone._extendedAttrs)) {
+                    clone._extendedAttrs[Number(key)] = clone._extendedAttrs[Number(key)].clone();
+                  }
+                  buffer.lines.set(row, clone);
+                }
+              }
+            }
+          });
+        }
+
+        await ctx.proxy.write(`\x1b[${row};${column}H\x1b_Ga=p,i=913,p=5,c=${cols},r=1,C=1\x1b\\`);
+        await timeout(100);
+        const currentStorageId = await ctx.page.evaluate<number | undefined>(
+          `window.imageAddon._handlers.get('kitty')._kittyIdToStorageId.get(913)`
+        );
+        ok(currentStorageId !== undefined);
+        const state = await getImageStorageState(currentStorageId);
+        deepStrictEqual(state.liveImageCounts, [[currentStorageId, cols]]);
+        deepStrictEqual(state.storedImageIds, [currentStorageId]);
+        deepStrictEqual(state.indexedImageIds, [currentStorageId]);
+        deepStrictEqual(state.placementStorageIds, [currentStorageId]);
+        strictEqual(state.tileCount, cols);
+        strictEqual(state.allIndexedLinesAttached, true);
+        for (const storageId of oldStorageIds) {
+          strictEqual(await countBufferImageRefs(storageId), 0);
+        }
+        oldStorageIds.push(currentStorageId);
+      }
+      strictEqual(await ctx.page.evaluate(`window.imageAddon._handlers.get('kitty').images.size`), 1);
+    });
+
     test('deletes only the targeted named placement and keeps image data reusable', async () => {
       await ctx.proxy.write(`\x1b_Ga=t,f=100,i=902;${KITTY_BLACK_1X1_BASE64}\x1b\\`);
       await ctx.proxy.write('\x1b[1;1H\x1b_Ga=p,i=902,p=10,c=1,r=1,C=1\x1b\\');
@@ -3047,6 +3097,50 @@ async function countBufferImageRefs(imageId: number): Promise<number> {
       }
     }
     return count;
+  }, imageId);
+}
+
+async function getImageStorageState(imageId: number): Promise<{
+  liveImageCounts: [number, number][];
+  storedImageIds: number[];
+  indexedImageIds: number[];
+  placementStorageIds: number[];
+  tileCount: number;
+  allIndexedLinesAttached: boolean;
+}> {
+  return ctx.page.evaluate((imageId: number) => {
+    const buffers = (window as any).term._core.buffers;
+    const storage = (window as any).imageAddon._storage;
+    const kittyStorage = (window as any).imageAddon._handlers.get('kitty')._kittyStorage;
+    const attachedLines = new Set<any>();
+    const liveImageCounts = new Map<number, number>();
+    for (const buffer of [buffers.normal, buffers.alt]) {
+      for (let row = 0; row < buffer.lines.length; row++) {
+        const line = buffer.lines.get(row);
+        if (!line) {
+          continue;
+        }
+        attachedLines.add(line);
+        for (let col = 0; col < line.length; col++) {
+          if (!(line._data[col * 3 + 2] & 268435456)) {
+            continue;
+          }
+          const cellImageId = line._extendedAttrs[col]?.imageId;
+          if (cellImageId !== undefined && cellImageId !== -1) {
+            liveImageCounts.set(cellImageId, (liveImageCounts.get(cellImageId) ?? 0) + 1);
+          }
+        }
+      }
+    }
+    const indexedLines = storage._imageCells.get(imageId);
+    return {
+      liveImageCounts: [...liveImageCounts].sort(([a], [b]) => a - b),
+      storedImageIds: [...storage._images.keys()].sort((a, b) => a - b),
+      indexedImageIds: [...storage._imageCells.keys()].sort((a, b) => a - b),
+      placementStorageIds: [...kittyStorage._storageIdToPlacement.keys()].sort((a, b) => a - b),
+      tileCount: storage._images.get(imageId)?.tileCount ?? -1,
+      allIndexedLinesAttached: !!indexedLines && [...indexedLines.keys()].every(line => attachedLines.has(line))
+    };
   }, imageId);
 }
 

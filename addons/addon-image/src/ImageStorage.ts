@@ -273,6 +273,7 @@ export class ImageStorage implements IDisposable {
 
   public deleteImages(ids: Iterable<number>): number {
     const uniqueIds = new Set(ids);
+    this._rebuildImageCellIndex(uniqueIds);
     const clearedCells = this._clearImageCells(uniqueIds);
     for (const id of uniqueIds) {
       const spec = this._images.get(id);
@@ -313,88 +314,7 @@ export class ImageStorage implements IDisposable {
   }
 
   public reconcileImageCellIndexes(imageIds: Iterable<number>): void {
-    const uniqueIds = new Set(imageIds);
-    const lineImageIds = new Map<IBufferLineExt, Set<number>>();
-    const liveTileCounts = new Map<number, number>();
-    for (const imageId of uniqueIds) {
-      const lines = this._imageCells.get(imageId);
-      if (!lines) {
-        continue;
-      }
-      liveTileCounts.set(imageId, 0);
-      for (const line of lines.keys()) {
-        let ids = lineImageIds.get(line);
-        if (!ids) {
-          ids = new Set();
-          lineImageIds.set(line, ids);
-        }
-        ids.add(imageId);
-      }
-    }
-
-    const attachedLines = new Set<IBufferLineExt>();
-    const buffers = [this._terminal._core.buffers.normal, this._terminal._core.buffers.alt];
-    for (const buffer of buffers) {
-      for (let row = 0; row < buffer.lines.length; row++) {
-        const line = buffer.lines.get(row) as IBufferLineExt | undefined;
-        if (line && lineImageIds.has(line)) {
-          attachedLines.add(line);
-        }
-      }
-    }
-
-    for (const [line, imageIdsOnLine] of lineImageIds) {
-      if (!attachedLines.has(line)) {
-        for (const imageId of imageIdsOnLine) {
-          this._imageCells.get(imageId)?.delete(line);
-        }
-        continue;
-      }
-      const liveColumns = new Map<number, Set<number>>();
-      for (const key of Object.keys(line._extendedAttrs)) {
-        const column = Number(key);
-        if (
-          column >= line.length ||
-          !(line._data[column * Cell.SIZE + Cell.BG] & BgFlags.HAS_EXTENDED)
-        ) {
-          continue;
-        }
-        const imageId = line._extendedAttrs[column]?.imageId;
-        if (imageId === undefined || !imageIdsOnLine.has(imageId)) {
-          continue;
-        }
-        let columns = liveColumns.get(imageId);
-        if (!columns) {
-          columns = new Set();
-          liveColumns.set(imageId, columns);
-        }
-        columns.add(column);
-      }
-      for (const imageId of imageIdsOnLine) {
-        const lines = this._imageCells.get(imageId);
-        const columns = liveColumns.get(imageId);
-        if (columns?.size) {
-          lines?.set(line, columns);
-          liveTileCounts.set(imageId, (liveTileCounts.get(imageId) ?? 0) + columns.size);
-        } else {
-          lines?.delete(line);
-        }
-      }
-    }
-
-    for (const [imageId, tileCount] of liveTileCounts) {
-      const spec = this._images.get(imageId);
-      if (spec) {
-        spec.tileCount = tileCount;
-      }
-    }
-    const emptyImageIds = [...uniqueIds].filter(imageId => {
-      const lines = this._imageCells.get(imageId);
-      return !!lines && !lines.size;
-    });
-    if (emptyImageIds.length) {
-      this.deleteImages(emptyImageIds);
-    }
+    this._rebuildImageCellIndex(new Set(imageIds));
   }
 
   /**
@@ -915,14 +835,24 @@ export class ImageStorage implements IDisposable {
     return cleared;
   }
 
-  private _rebuildImageCellIndex(): void {
-    this._imageCells.clear();
-    for (const [id, spec] of this._images) {
-      this._imageCells.set(id, new Map());
-      spec.tileCount = 0;
+  private _rebuildImageCellIndex(imageIds?: ReadonlySet<number>): void {
+    const targetIds = imageIds ?? new Set([
+      ...this._images.keys(),
+      ...this._evictedImages.keys(),
+      ...this._imageCells.keys()
+    ]);
+    if (!imageIds) {
+      this._imageCells.clear();
     }
-    for (const id of this._evictedImages.keys()) {
-      this._imageCells.set(id, new Map());
+    for (const imageId of targetIds) {
+      const spec = this._images.get(imageId);
+      if (!spec && !this._evictedImages.has(imageId) && !this._imageCells.has(imageId)) {
+        continue;
+      }
+      this._imageCells.set(imageId, new Map());
+      if (spec) {
+        spec.tileCount = 0;
+      }
     }
     const buffers = [this._terminal._core.buffers.normal, this._terminal._core.buffers.alt];
     for (const buffer of buffers) {
@@ -941,7 +871,7 @@ export class ImageStorage implements IDisposable {
             continue;
           }
           const imageId = line._extendedAttrs[x]?.imageId;
-          if (imageId === undefined || !this._imageCells.has(imageId)) {
+          if (imageId === undefined || !targetIds.has(imageId) || !this._imageCells.has(imageId)) {
             continue;
           }
           this._trackCell(imageId, line, x);
@@ -952,9 +882,10 @@ export class ImageStorage implements IDisposable {
         }
       }
     }
-    const emptyImageIds = [...this._imageCells]
-      .filter(([, lines]) => !lines.size)
-      .map(([imageId]) => imageId);
+    const emptyImageIds = [...targetIds].filter(imageId => {
+      const lines = this._imageCells.get(imageId);
+      return !!lines && !lines.size;
+    });
     for (const imageId of emptyImageIds) {
       const marker = this._images.get(imageId)?.marker ?? this._evictedImages.get(imageId)?.marker;
       marker?.dispose();
