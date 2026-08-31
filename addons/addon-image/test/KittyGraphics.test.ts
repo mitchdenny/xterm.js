@@ -1470,7 +1470,14 @@ test.describe('Kitty Graphics Protocol', () => {
                 if (line) {
                   const clone = line.clone();
                   for (const key of Object.keys(clone._extendedAttrs)) {
-                    clone._extendedAttrs[Number(key)] = clone._extendedAttrs[Number(key)].clone();
+                    const column = Number(key);
+                    const attrs = clone._extendedAttrs[column];
+                    const payload = attrs.payload;
+                    const clonedAttrs = attrs.clone();
+                    if (payload) {
+                      clonedAttrs.payload = Object.assign(Object.create(Object.getPrototypeOf(payload)), payload);
+                    }
+                    clone._extendedAttrs[column] = clonedAttrs;
                   }
                   buffer.lines.set(row, clone);
                 }
@@ -2936,8 +2943,9 @@ test.describe('Kitty Graphics Protocol', () => {
           const line = buffer.lines.get(row);
           for (const key of Object.keys(line?._extendedAttrs ?? {})) {
             const column = Number(key);
-            if (line._extendedAttrs[column]?.imageId === storageId) {
+            if (line._extendedAttrs[column]?.payload?.imageId === storageId) {
               delete line._extendedAttrs[column];
+              line._data[column * 3 + 2] &= ~268435456;
             }
           }
         }
@@ -3071,14 +3079,14 @@ async function hasTileAtBufferCell(x: number, y: number): Promise<boolean> {
 async function getViewportCellImageId(col: number, row: number): Promise<number> {
   return ctx.page.evaluate(([col, row]: number[]) => {
     const buffer = (window as any).term._core.buffer;
-    return buffer.lines.get(buffer.ybase + row)?._extendedAttrs[col]?.imageId ?? -1;
+    return buffer.lines.get(buffer.ybase + row)?.getExtended(col)?.payload?.imageId ?? -1;
   }, [col, row]);
 }
 
 async function getAbsoluteCellImageId(col: number, row: number): Promise<number> {
   return ctx.page.evaluate(([col, row]: number[]) => {
     const buffer = (window as any).term._core.buffer;
-    return buffer.lines.get(row)?._extendedAttrs[col]?.imageId ?? -1;
+    return buffer.lines.get(row)?.getExtended(col)?.payload?.imageId ?? -1;
   }, [col, row]);
 }
 
@@ -3089,8 +3097,11 @@ async function countBufferImageRefs(imageId: number): Promise<number> {
     for (const buffer of [buffers.normal, buffers.alt]) {
       for (let row = 0; row < buffer.lines.length; row++) {
         const line = buffer.lines.get(row);
-        for (const key of Object.keys(line?._extendedAttrs ?? {})) {
-          if (line._extendedAttrs[Number(key)]?.imageId === imageId) {
+        if (!line) {
+          continue;
+        }
+        for (let column = 0; column < line.length; column++) {
+          if (line.getExtended(column)?.payload?.imageId === imageId) {
             count++;
           }
         }
@@ -3125,7 +3136,7 @@ async function getImageStorageState(imageId: number): Promise<{
           if (!(line._data[col * 3 + 2] & 268435456)) {
             continue;
           }
-          const cellImageId = line._extendedAttrs[col]?.imageId;
+          const cellImageId = line.getExtended(col)?.payload?.imageId;
           if (cellImageId !== undefined && cellImageId !== -1) {
             liveImageCounts.set(cellImageId, (liveImageCounts.get(cellImageId) ?? 0) + 1);
           }
@@ -3154,9 +3165,11 @@ async function getActiveBufferImageRefs(imageId: number): Promise<{ row: number,
     const refs: { row: number, column: number, lineLength: number }[] = [];
     for (let row = 0; row < buffer.lines.length; row++) {
       const line = buffer.lines.get(row);
-      for (const key of Object.keys(line?._extendedAttrs ?? {})) {
-        const column = Number(key);
-        if (line._extendedAttrs[column]?.imageId === imageId) {
+      if (!line) {
+        continue;
+      }
+      for (let column = 0; column < line.length; column++) {
+        if (line.getExtended(column)?.payload?.imageId === imageId) {
           refs.push({ row, column, lineLength: line.length });
         }
       }
